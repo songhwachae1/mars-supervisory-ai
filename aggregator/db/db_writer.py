@@ -5,7 +5,7 @@ from typing import Optional
 import asyncpg
 
 from aggregator.schemas.models import RobotState, RobotEvent
-from aggregator import queries
+from aggregator.db import queries
 
 logger = logging.getLogger(__name__)
 

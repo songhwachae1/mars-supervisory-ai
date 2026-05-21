@@ -1,32 +1,11 @@
 import logging
 import math
-from typing import Callable, Dict, Tuple, Optional
+from typing import Callable
+
 from aggregator.schemas.models import RobotState
+from aggregator.semantics.navigation_semantics import NAV_STATUS_MAP, resolve_zone
 
 logger = logging.getLogger(__name__)
-
-
-# ─────────────────────────────────────────────
-# Zone Map
-# Maps (x, y) bounding boxes to zone labels.
-# Extend this with your warehouse floor plan.
-# ─────────────────────────────────────────────
-
-# Format: zone_id → (x_min, x_max, y_min, y_max)
-ZONE_MAP: Dict[str, Tuple[float, float, float, float]] = {
-  "zone_a":   (0.0,  10.0, 0.0,  10.0),
-  "zone_b":   (10.0, 20.0, 0.0,  10.0),
-  "zone_c":   (0.0,  10.0, 10.0, 20.0),
-  "charging": (18.0, 22.0, 18.0, 22.0),
-  "entrance": (-2.0,  2.0, -2.0,  2.0),
-}
-
-
-def resolve_zone(x: float, y: float) -> Optional[str]:
-  for zone_id, (x_min, x_max, y_min, y_max) in ZONE_MAP.items():
-    if x_min <= x <= x_max and y_min <= y <= y_max:
-      return zone_id
-  return None
 
 
 class NavigationMonitor:
@@ -34,8 +13,8 @@ class NavigationMonitor:
   Subscribes to navigation and odometry ROS2 topics.
 
   Topics consumed:
-  - /robot_{id}/odom          (nav_msgs/Odometry)
-  - /robot_{id}/nav_status    (std_msgs/String or action feedback)
+  - /{robot_id}/odom          (nav_msgs/Odometry)
+  - /{robot_id}/nav_status    (std_msgs/String)
 
   Raw ROS input     → Semantic output
   ─────────────────────────────────────────────────────────
@@ -49,26 +28,12 @@ class NavigationMonitor:
   - do NOT plan or reason
   """
 
-  # Map raw ROS nav status strings → semantic vocabulary
-  NAV_STATUS_MAP = {
-    "NAVIGATING":    "navigating",
-    "IN_PROGRESS":   "navigating",
-    "BLOCKED":       "path_blocked",
-    "OBSTACLE":      "path_blocked",
-    "SUCCEEDED":     "arrived",
-    "ARRIVED":       "arrived",
-    "FAILED":        "failed",
-    "ABORTED":       "failed",
-    "UNKNOWN":       None,
-  }
-
   def __init__(self, robot_id: str, on_state_update: Callable[[RobotState], None]):
     self._robot_id = robot_id
     self._on_state_update = on_state_update
 
   # ─────────────────────────────────────────────
   # Odometry callback
-  # nav_msgs/Odometry
   # ─────────────────────────────────────────────
 
   def handle_odom(self, msg) -> None:
@@ -79,39 +44,35 @@ class NavigationMonitor:
       x = pos.x
       y = pos.y
       theta = self._yaw_from_quaternion(ori.x, ori.y, ori.z, ori.w)
-      zone = resolve_zone(x, y)
 
-      state = RobotState(
+      self._on_state_update(RobotState(
         robot_id=self._robot_id,
         x=round(x, 4),
         y=round(y, 4),
         theta=round(theta, 4),
-        current_zone=zone,
-      )
-      self._on_state_update(state)
+        current_zone=resolve_zone(x, y),
+      ))
 
     except Exception as e:
       logger.error(f"NavigationMonitor odom error for {self._robot_id}: {e}")
 
   # ─────────────────────────────────────────────
   # Navigation status callback
-  # std_msgs/String (or custom status message)
   # ─────────────────────────────────────────────
 
   def handle_nav_status(self, msg) -> None:
     try:
       raw = msg.data.strip().upper()
-      semantic = self.NAV_STATUS_MAP.get(raw)
+      semantic = NAV_STATUS_MAP.get(raw)
 
       if semantic is None:
         logger.debug(f"NavigationMonitor: unmapped nav status '{raw}' for {self._robot_id}")
         return
 
-      state = RobotState(
+      self._on_state_update(RobotState(
         robot_id=self._robot_id,
         navigation_status=semantic,
-      )
-      self._on_state_update(state)
+      ))
 
     except Exception as e:
       logger.error(f"NavigationMonitor nav_status error for {self._robot_id}: {e}")
