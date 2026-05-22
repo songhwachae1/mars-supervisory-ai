@@ -27,11 +27,12 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 ROBOT_IDS = [
-  "robot_1",
-  "robot_2",
+  "3f8a1b2c-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
+  "7e6d5c4b-3a2f-1e0d-9c8b-7a6f5e4d3c2b",
 ]
 
-DB_DSN = "postgresql://user:password@localhost:5432/warehouse"
+#DB_DSN = "postgresql://user:password@localhost:5432/warehouse"
+DB_DSN = "postgresql://songhwa:csh110427dg93@localhost:5432/warehouse"
 
 
 class AggregatorNode(Node):
@@ -186,25 +187,24 @@ class AggregatorNode(Node):
     3. Persist updated state to PostgreSQL
     4. Persist any new events to PostgreSQL
     """
-    merged = self._merge_state(partial)
-    events = self._detector.detect(merged)
-
-    # Update cache AFTER detection so detector sees old→new transition
-    self._cache.set(merged)
-
-    # Async DB writes (non-blocking)
-    asyncio.run_coroutine_threadsafe(
-      self._db.upsert_robot_state(merged),
-      self._loop,
-    )
-
+    merged = self._cache.merge_and_set(partial) # atomic
+    events = self._detector.detect(merged) # uses snapshot, not live cache
+    
     for event in events:
       logger.info(f"Event: {event.event_type} | robot: {event.robot_id}")
       asyncio.run_coroutine_threadsafe(
         self._db.insert_event(event),
         self._loop,
       )
+    
+    # Async DB writes (non-blocking)
+    asyncio.run_coroutine_threadsafe(
+      self._db.upsert_robot_state(merged),
+      self._loop,
+    )
 
+
+  '''
   def _merge_state(self, partial: RobotState) -> RobotState:
     """
     Merge partial state fields into the existing cached state.
@@ -235,6 +235,7 @@ class AggregatorNode(Node):
       last_heartbeat=     pick(partial.last_heartbeat,      cached.last_heartbeat),
       health_score=       pick(partial.health_score,        cached.health_score),
     )
+  '''
 
   # ─────────────────────────────────────────────
   # Shutdown

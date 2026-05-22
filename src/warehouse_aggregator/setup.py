@@ -9,19 +9,21 @@ setup(
   data_files=[
     ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
     (f"share/{package_name}", ["package.xml"]),
+		(f"lib/{package_name}", []),
   ],
   install_requires=[
     "setuptools",
     "asyncpg",
   ],
   zip_safe=True,
-  maintainer="you",
-  maintainer_email="you@example.com",
+  maintainer="Songhwa Chae",
+  maintainer_email="songhwachae93@gmail.com",
   description="Context Aggregator: ROS2 → PostgreSQL Blackboard",
   license="MIT",
   entry_points={
     "console_scripts": [
       "aggregator_node = aggregator.aggregator_node:main",
+			"mock_publisher = aggregator.mock_publisher:main"
     ],
   },
 )

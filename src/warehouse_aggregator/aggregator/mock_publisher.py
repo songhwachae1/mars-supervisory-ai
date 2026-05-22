@@ -20,7 +20,10 @@ from std_msgs.msg import String
 from geometry_msgs.msg import Quaternion
 
 
-ROBOT_IDS = ["robot_1", "robot_2"]
+ROBOT_IDS = [
+  "3f8a1b2c-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
+  "7e6d5c4b-3a2f-1e0d-9c8b-7a6f5e4d3c2b",
+]
 
 
 def yaw_to_quaternion(yaw: float) -> Quaternion:
@@ -45,11 +48,11 @@ class MockRobotPublisher(Node):
   def __init__(self):
     super().__init__("mock_robot_publisher")
 
-    self._publishers = {}
+    self._pubs = {}
     self._tick = 0
 
     for robot_id in ROBOT_IDS:
-      self._publishers[robot_id] = {
+      self._pubs[robot_id] = {
         "battery":    self.create_publisher(BatteryState, f"/{robot_id}/battery_state", 10),
         "odom":       self.create_publisher(Odometry,     f"/{robot_id}/odom", 10),
         "nav_status": self.create_publisher(String,       f"/{robot_id}/nav_status", 10),
@@ -66,7 +69,7 @@ class MockRobotPublisher(Node):
       self._publish_robot(robot_id, offset=i * 5.0)
 
   def _publish_robot(self, robot_id: str, offset: float) -> None:
-    pubs = self._publishers[robot_id]
+    pubs = self._pubs[robot_id]
     t = self._tick
 
     # ── Battery ──────────────────────────────────
