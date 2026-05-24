@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 ROBOT_IDS = [
-  "3f8a1b2c-4d5e-6f7a-8b9c-0d1e2f3a4b5c",
-  "7e6d5c4b-3a2f-1e0d-9c8b-7a6f5e4d3c2b",
+  "robot_01",
+  "robot_02",
 ]
 
 #DB_DSN = "postgresql://user:password@localhost:5432/warehouse"

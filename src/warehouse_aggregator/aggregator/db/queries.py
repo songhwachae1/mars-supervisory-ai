@@ -30,7 +30,7 @@ UPSERT_ROBOT_STATE = """
     updated_at
   )
   VALUES (
-    $1::uuid, $2,
+    $1, $2,
     $3, $4, $5,
     $6,
     $7,
@@ -74,6 +74,6 @@ INSERT_ROBOT_EVENT = """
     created_at
   )
   VALUES (
-    $1::uuid, $2, $3, $4, $5::jsonb, FALSE, $6
+    $1, $2, $3, $4, $5::jsonb, FALSE, $6
   )
 """

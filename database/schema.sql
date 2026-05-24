@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS inventory_items (
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS robot_state (
-    robot_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    robot_id            VARCHAR(50) PRIMARY KEY,
 
     robot_name          VARCHAR(50),
 
@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS robot_state (
 CREATE TABLE IF NOT EXISTS robot_events (
     id                  BIGSERIAL PRIMARY KEY,
 
-    robot_id            UUID,
+    robot_id            VARCHAR(50),
 
     event_type          VARCHAR(100) NOT NULL,
 
@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS robot_events (
 CREATE TABLE IF NOT EXISTS missions (
     mission_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-    robot_id                UUID,
+    robot_id                VARCHAR(50),
 
     mission_type            VARCHAR(50),
 
@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS mission_history (
 
     mission_id              UUID,
 
-    robot_id                UUID,
+    robot_id                VARCHAR(50),
 
     mission_type            VARCHAR(50),
 
@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS mission_history (
 
     priority_score          FLOAT,
 
-    assigned_robot_id       UUID,
+    assigned_robot_id       VARCHAR(50),
 
     status                  VARCHAR(30),
 
@@ -219,7 +219,7 @@ CREATE TABLE tasks (
 
     mission_id              UUID,
 
-    robot_id                UUID,
+    robot_id                VARCHAR(50),
 
     task_type               VARCHAR(50),
 
@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS agent_commands (
 
     mission_id              UUID,
 
-    robot_id                UUID,
+    robot_id                VARCHAR(50),
 
     source_agent            VARCHAR(50),
 
@@ -310,7 +310,7 @@ CREATE TABLE IF NOT EXISTS action_library (
 CREATE TABLE IF NOT EXISTS anomaly_records (
     anomaly_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-    robot_id                UUID,
+    robot_id                VARCHAR(50),
 
     anomaly_type            VARCHAR(100),
 
