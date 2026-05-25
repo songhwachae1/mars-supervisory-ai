@@ -103,6 +103,29 @@ CREATE TABLE IF NOT EXISTS robot_events (
 
     payload             JSONB DEFAULT '{}',
 
+    -- Lifecycle status:
+    --   pending     → persisted, awaiting dispatch
+    --   dispatched  → notified to orchestrator
+    --   in_progress → workflow accepted/running
+    --   completed   → workflow finished successfully
+    --   failed      → workflow failed
+    --   expired     → no orchestrator picked it up in time
+    --   suppressed  → never independently dispatched (collapsed into another row)
+    status              VARCHAR(30) DEFAULT 'pending',
+
+    -- Deduplication: events with the same dedup_key collapse onto the
+    -- first open row instead of creating a new row. dedup_count tracks
+    -- how many duplicates were absorbed.
+    dedup_key           VARCHAR(150),
+    dedup_count         INT DEFAULT 1,
+
+    -- Workflow linkage (set when orchestrator accepts the event)
+    workflow_id         UUID,
+
+    dispatched_at       TIMESTAMP,
+    completed_at        TIMESTAMP,
+    last_updated_at     TIMESTAMP DEFAULT NOW(),
+
     processed           BOOLEAN DEFAULT FALSE,
 
     created_at          TIMESTAMP DEFAULT NOW()
@@ -422,6 +445,14 @@ ON robot_events(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_robot_events_processed
 ON robot_events(processed);
+
+CREATE INDEX IF NOT EXISTS idx_robot_events_status
+ON robot_events(status);
+
+-- Composite index supports the dedup lookup:
+-- "is there an open row for this (robot, event_type)?"
+CREATE INDEX IF NOT EXISTS idx_robot_events_dedup_open
+ON robot_events(dedup_key, status);
 
 -- =====================================================
 -- ROBOT STATE INDEXES

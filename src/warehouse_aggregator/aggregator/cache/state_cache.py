@@ -1,5 +1,5 @@
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from aggregator.schemas.models import RobotState
 
 
@@ -25,18 +25,23 @@ class StateCache:
 
 	# state_cache.py
 
-	def merge_and_set(self, partial: RobotState) -> RobotState:
+	def merge_and_set(self, partial: RobotState) -> Tuple[Optional[RobotState], RobotState]:
 		"""
-		Atomically merge partial state into cached state and return
-		the resulting full state. The entire read-decide-write
-		sequence is held under one lock.
+		Atomically merge partial state into cached state.
+
+		Returns (prev, merged):
+		  prev    — cached state before the merge (None on first observation)
+		  merged  — new cached state after the merge
+
+		The read-decide-write sequence is held under one lock so the
+		event pipeline can rely on `prev` and `merged` being a true pair.
 		"""
 		with self._lock:
 			cached = self._states.get(partial.robot_id)
 
 			if cached is None:
 				self._states[partial.robot_id] = partial
-				return partial
+				return None, partial
 
 			def pick(new_val, cached_val):
 				return new_val if new_val is not None else cached_val
@@ -58,7 +63,7 @@ class StateCache:
 			)
 
 			self._states[partial.robot_id] = merged
-			return merged
+			return cached, merged
 
 	'''
 	def set(self, state: RobotState) -> None:

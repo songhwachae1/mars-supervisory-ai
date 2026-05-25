@@ -13,10 +13,11 @@ from std_msgs.msg import String
 from aggregator.schemas.models import RobotState
 from aggregator.cache.state_cache import StateCache
 from aggregator.db.db_writer import DBWriter
-from aggregator.event_detector import EventDetector
 from aggregator.monitors.battery_monitor import BatteryMonitor
 from aggregator.monitors.navigation_monitor import NavigationMonitor
 from aggregator.semantics.operational_semantics import OPERATIONAL_STATUS_MAP
+
+from event_system import EventPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +44,15 @@ class AggregatorNode(Node):
   - subscribe to all robot ROS2 topics
   - delegate raw message handling to per-robot monitors
   - merge partial state updates into the state cache
-  - detect semantic events via EventDetector
-  - persist state and events to PostgreSQL via DBWriter
+  - persist robot state to PostgreSQL via DBWriter
+  - hand state transitions to the event_system pipeline
 
   Does NOT:
   - plan or reason
   - call LLMs
   - execute robot commands
   - contain orchestration logic
+  - own event detection or persistence (that's the event_system's job)
   """
 
   def __init__(self):
@@ -60,7 +62,6 @@ class AggregatorNode(Node):
     # ─── Shared infrastructure ───
     self._cache = StateCache()
     self._db = DBWriter(dsn=DB_DSN)
-    self._detector = EventDetector(cache=self._cache)
 
     # ─── Async event loop in background thread ───
     # ROS2 callbacks are sync; DB writes are async.
@@ -77,6 +78,15 @@ class AggregatorNode(Node):
     future = asyncio.run_coroutine_threadsafe(self._db.connect(), self._loop)
     future.result(timeout=10)
 
+    # ─── Event pipeline ───
+    # Shares the asyncpg pool with DBWriter so we don't open two pools.
+    self._pipeline = EventPipeline.build_default(self._db.pool)
+    # Background sweeper for orchestrator-timeout cleanup.
+    asyncio.run_coroutine_threadsafe(
+      self._start_pipeline_expiry(),
+      self._loop,
+    )
+
     # ─── Per-robot monitors and subscriptions ───
     self._battery_monitors: Dict[str, BatteryMonitor] = {}
     self._nav_monitors: Dict[str, NavigationMonitor] = {}
@@ -85,6 +95,11 @@ class AggregatorNode(Node):
       self._register_robot(robot_id)
 
     self.get_logger().info(f"AggregatorNode ready. Monitoring: {ROBOT_IDS}")
+
+  async def _start_pipeline_expiry(self) -> None:
+    # Must be called from within the async loop so asyncio.create_task
+    # binds to the right loop.
+    self._pipeline.start_expiry_loop(ttl_seconds=60, interval_seconds=30)
 
   # ─────────────────────────────────────────────
   # Robot Registration
@@ -182,66 +197,36 @@ class AggregatorNode(Node):
     Called by every monitor with a partial RobotState update.
 
     Pipeline:
-    1. Merge partial fields into cached full state
-    2. Detect events from the transition
-    3. Persist updated state to PostgreSQL
-    4. Persist any new events to PostgreSQL
+    1. Merge partial fields into cached full state (atomic; returns prev + merged)
+    2. Persist updated state to PostgreSQL
+    3. Hand the (prev, merged) transition to the event_system
     """
-    merged = self._cache.merge_and_set(partial) # atomic
-    events = self._detector.detect(merged) # uses snapshot, not live cache
-    
-    for event in events:
-      logger.info(f"Event: {event.event_type} | robot: {event.robot_id}")
-      asyncio.run_coroutine_threadsafe(
-        self._db.insert_event(event),
-        self._loop,
-      )
-    
-    # Async DB writes (non-blocking)
+    prev, merged = self._cache.merge_and_set(partial)
+
+    # Async DB write for the robot state row (non-blocking).
     asyncio.run_coroutine_threadsafe(
       self._db.upsert_robot_state(merged),
       self._loop,
     )
 
-
-  '''
-  def _merge_state(self, partial: RobotState) -> RobotState:
-    """
-    Merge partial state fields into the existing cached state.
-    Fields set to None in the partial update are preserved from cache.
-    """
-    cached = self._cache.get(partial.robot_id)
-
-    if cached is None:
-      # First time seeing this robot
-      return partial
-
-    # Merge: prefer partial's non-None values, fall back to cached
-    def pick(new_val, cached_val):
-      return new_val if new_val is not None else cached_val
-
-    return RobotState(
-      robot_id=partial.robot_id,
-      robot_name=         pick(partial.robot_name,          cached.robot_name),
-      x=                  pick(partial.x,                   cached.x),
-      y=                  pick(partial.y,                   cached.y),
-      theta=              pick(partial.theta,                cached.theta),
-      current_zone=       pick(partial.current_zone,        cached.current_zone),
-      battery_pct=        pick(partial.battery_pct,         cached.battery_pct),
-      operational_status= pick(partial.operational_status,  cached.operational_status),
-      navigation_status=  pick(partial.navigation_status,   cached.navigation_status),
-      current_mission_id= pick(partial.current_mission_id,  cached.current_mission_id),
-      current_task_id=    pick(partial.current_task_id,     cached.current_task_id),
-      last_heartbeat=     pick(partial.last_heartbeat,      cached.last_heartbeat),
-      health_score=       pick(partial.health_score,        cached.health_score),
+    # Hand the transition to the event_system. It owns detection,
+    # construction, severity, dedup, persistence, and dispatch.
+    asyncio.run_coroutine_threadsafe(
+      self._pipeline.submit(prev, merged),
+      self._loop,
     )
-  '''
 
   # ─────────────────────────────────────────────
   # Shutdown
   # ─────────────────────────────────────────────
 
   def destroy_node(self) -> None:
+    stop_future = asyncio.run_coroutine_threadsafe(self._pipeline.stop_expiry_loop(), self._loop)
+    try:
+      stop_future.result(timeout=5)
+    except Exception:
+      pass
+
     future = asyncio.run_coroutine_threadsafe(self._db.close(), self._loop)
     future.result(timeout=5)
     self._loop.call_soon_threadsafe(self._loop.stop)

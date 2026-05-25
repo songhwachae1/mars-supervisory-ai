@@ -1,10 +1,9 @@
-import json
 import logging
 from typing import Optional
 
 import asyncpg
 
-from aggregator.schemas.models import RobotState, RobotEvent
+from aggregator.schemas.models import RobotState
 from aggregator.db import queries
 
 logger = logging.getLogger(__name__)
@@ -16,7 +15,9 @@ class DBWriter:
 
   Writes to:
   - robot_state  : upsert current semantic state
-  - robot_events : insert new events
+
+  Event writes are owned by the event_system package; this class only
+  exposes its connection pool so that package can share it.
 
   Uses asyncpg for non-blocking I/O so it does not stall
   the ROS2 subscription callbacks.
@@ -37,6 +38,11 @@ class DBWriter:
     if self._pool:
       await self._pool.close()
       logger.info("DBWriter pool closed")
+
+  @property
+  def pool(self) -> Optional[asyncpg.Pool]:
+    """The shared asyncpg pool. Used by event_system to avoid duplicating connections."""
+    return self._pool
 
   # ─────────────────────────────────────────────
   # Robot State
@@ -65,27 +71,3 @@ class DBWriter:
         )
     except Exception as e:
       logger.error(f"upsert_robot_state failed for {state.robot_id}: {e}")
-
-  # ─────────────────────────────────────────────
-  # Robot Events
-  # ─────────────────────────────────────────────
-
-  async def insert_event(self, event: RobotEvent) -> None:
-    if not self._pool:
-      logger.error("DBWriter not connected")
-      return
-
-    try:
-      async with self._pool.acquire() as conn:
-        await conn.execute(
-          queries.INSERT_ROBOT_EVENT,
-          event.robot_id,
-          event.event_type,
-          event.severity,
-          event.source_component,
-          json.dumps(event.payload),
-          event.created_at,
-        )
-      logger.info(f"Event inserted: {event.event_type} for robot {event.robot_id}")
-    except Exception as e:
-      logger.error(f"insert_event failed for {event.robot_id}: {e}")

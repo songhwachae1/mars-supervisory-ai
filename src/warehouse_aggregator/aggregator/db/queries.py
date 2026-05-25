@@ -59,21 +59,4 @@ UPSERT_ROBOT_STATE = """
 """
 
 
-# ─────────────────────────────────────────────
-# robot_events
-# ─────────────────────────────────────────────
-
-INSERT_ROBOT_EVENT = """
-  INSERT INTO robot_events (
-    robot_id,
-    event_type,
-    severity,
-    source_component,
-    payload,
-    processed,
-    created_at
-  )
-  VALUES (
-    $1, $2, $3, $4, $5::jsonb, FALSE, $6
-  )
-"""
+# Event writes live in the event_system package now (warehouse_event_system).
