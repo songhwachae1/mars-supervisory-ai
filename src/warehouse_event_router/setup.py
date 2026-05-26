@@ -1,6 +1,6 @@
 from setuptools import setup, find_packages
 
-package_name = "warehouse_aggregator"
+package_name = "warehouse_event_router"
 
 setup(
   name=package_name,
@@ -9,7 +9,7 @@ setup(
   data_files=[
     ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
     (f"share/{package_name}", ["package.xml"]),
-		(f"lib/{package_name}", []),
+    (f"lib/{package_name}", []),
   ],
   install_requires=[
     "setuptools",
@@ -19,12 +19,11 @@ setup(
   zip_safe=True,
   maintainer="Songhwa Chae",
   maintainer_email="songhwachae93@gmail.com",
-  description="Context Aggregator: ROS2 → PostgreSQL Blackboard",
+  description="Deterministic event router: events → LangGraph workflow launches",
   license="MIT",
   entry_points={
     "console_scripts": [
-      "aggregator_node = aggregator.aggregator_node:main",
-			"mock_publisher = aggregator.mock_publisher:main",
+      "event_router = event_router.router_main:main",
     ],
   },
 )

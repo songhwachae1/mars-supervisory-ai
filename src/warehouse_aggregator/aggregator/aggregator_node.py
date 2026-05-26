@@ -12,6 +12,7 @@ from std_msgs.msg import String
 
 from aggregator.schemas.models import RobotState
 from aggregator.cache.state_cache import StateCache
+from aggregator import config
 from aggregator.db.db_writer import DBWriter
 from aggregator.monitors.battery_monitor import BatteryMonitor
 from aggregator.monitors.navigation_monitor import NavigationMonitor
@@ -22,18 +23,11 @@ from event_system import EventPipeline
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# Configuration
-# Extend ROBOT_IDS as more robots are added
-# ─────────────────────────────────────────────
-
+# Extend ROBOT_IDS as more robots are added.
 ROBOT_IDS = [
   "robot_01",
   "robot_02",
 ]
-
-#DB_DSN = "postgresql://user:password@localhost:5432/warehouse"
-DB_DSN = "postgresql://songhwa:csh110427dg93@localhost:5432/warehouse"
 
 
 class AggregatorNode(Node):
@@ -61,7 +55,7 @@ class AggregatorNode(Node):
 
     # ─── Shared infrastructure ───
     self._cache = StateCache()
-    self._db = DBWriter(dsn=DB_DSN)
+    self._db = DBWriter(dsn=config.DB_DSN)
 
     # ─── Async event loop in background thread ───
     # ROS2 callbacks are sync; DB writes are async.
