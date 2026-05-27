@@ -22,7 +22,7 @@ import logging
 import asyncpg
 from langgraph.graph import StateGraph, END
 
-from workflows import db, terminal
+from workflows import db, terminal, tools
 from workflows.graphs._shared import decision, audit_checkpoint
 from workflows.state import WorkflowState
 
@@ -33,7 +33,8 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
 
   async def claim_pending_mission(state: WorkflowState) -> dict:
     robot_id = state["event"]["robot_id"]
-    mission = await db.claim_pending_mission(pool, robot_id)
+    receipt = await tools.claim_mission(pool, robot_id=robot_id)
+    mission = receipt.meta.get("mission")
     await audit_checkpoint(
       pool, state["workflow_id"], "claim_pending_mission",
       {"claimed": mission is not None, "mission": mission},
@@ -59,28 +60,20 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
       return {"decisions": [decision("dispatch_first_task", warning="mission_has_no_tasks")]}
 
     task_id = str(next_task["task_id"])
-    await db.activate_task(pool, task_id)
-    command_id = await db.insert_agent_command(
+    receipt = await tools.dispatch_task(
       pool,
+      task_id=task_id,
       robot_id=state["event"]["robot_id"],
-      source_agent="scheduling_workflow",
-      command_type="start_task",
-      payload={
-        "task_id":    task_id,
-        "task_type":  next_task.get("task_type"),
-        "mission_id": mission_id,
-      },
-      priority=next_task.get("priority") or 0,
       mission_id=mission_id,
+      task_type=next_task.get("task_type"),
+      priority=next_task.get("priority") or 0,
+      issued_by="scheduling_workflow",
     )
-    await audit_checkpoint(
-      pool, state["workflow_id"], "dispatch_first_task",
-      {"task_id": task_id, "command_id": command_id},
-    )
+    await audit_checkpoint(pool, state["workflow_id"], "dispatch_first_task", receipt.to_dict())
     return {
-      "next_task_id": task_id,
-      "commands_issued": [command_id],
-      "decisions": [decision("dispatch_first_task", task_id=task_id, command_id=command_id)],
+      "next_task_id":    task_id,
+      "commands_issued": [receipt.command_id] if receipt.command_id else [],
+      "decisions": [decision("dispatch_first_task", **receipt.to_dict())],
     }
 
   async def finalize(state: WorkflowState) -> dict:

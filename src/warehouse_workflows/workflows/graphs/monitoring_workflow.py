@@ -19,7 +19,7 @@ import logging
 import asyncpg
 from langgraph.graph import StateGraph, END
 
-from workflows import db, terminal
+from workflows import terminal, tools
 from workflows.graphs._shared import decision, audit_checkpoint
 from workflows.state import WorkflowState
 
@@ -30,25 +30,23 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
 
   async def record_observation(state: WorkflowState) -> dict:
     event = state["event"]
-    anomaly_id = await db.insert_anomaly(
+    receipt = await tools.record_anomaly(
       pool,
       robot_id=event["robot_id"],
       anomaly_type="health_degraded",
       severity="warning",
       detected_by="monitoring_workflow",
       related_event_id=event["event_id"],
-      description=(
-        f"{event['robot_id']} health degraded; continuing under observation."
-      ),
+      description=f"{event['robot_id']} health degraded; continuing under observation.",
       state_snapshot={
         "robot_state":   state.get("robot_state"),
         "event_payload": event.get("payload"),
       },
     )
-    await audit_checkpoint(pool, state["workflow_id"], "record_observation", {"anomaly_id": anomaly_id})
+    await audit_checkpoint(pool, state["workflow_id"], "record_observation", receipt.to_dict())
     return {
-      "anomaly_id": anomaly_id,
-      "decisions":  [decision("record_observation", anomaly_id=anomaly_id)],
+      "anomaly_id": receipt.meta["anomaly_id"],
+      "decisions":  [decision("record_observation", **receipt.to_dict())],
     }
 
   async def finalize(state: WorkflowState) -> dict:

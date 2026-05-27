@@ -18,9 +18,9 @@ import logging
 import math
 
 import asyncpg
-from langgraph.graph import StateGraph
+from langgraph.graph import END, StateGraph
 
-from workflows import db, terminal
+from workflows import db, terminal, tools
 from workflows.graphs._shared import decision, audit_checkpoint
 from workflows.state import WorkflowState
 
@@ -152,23 +152,18 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     if charger is None:
       return {"decisions": [decision("finish_then_charge", action="skipped_no_charger")]}
 
-    command_id = await db.insert_agent_command(
+    receipt = await tools.navigate_to(
       pool,
       robot_id=state["event"]["robot_id"],
-      source_agent="charging_workflow",
-      command_type="navigate_to",
-      payload={
-        "destination_shelf_id": charger["shelf_id"],
-        "x": charger["x"],
-        "y": charger["y"],
-        "reason": "battery_low but enough to finish the task",
-      },
-      priority=3,
+      destination_shelf_id=charger["shelf_id"],
+      reason="battery_low_finish_first",
+      urgency="scheduled",
+      issued_by="charging_workflow",
     )
-    await audit_checkpoint(pool, state["workflow_id"], "finish_then_charge", {"command_id": command_id})
+    await audit_checkpoint(pool, state["workflow_id"], "finish_then_charge", receipt.to_dict())
     return {
-      "commands_issued": [command_id],
-      "decisions": [decision("finish_then_charge", command_id=command_id, target=charger["shelf_id"])],
+      "commands_issued": [receipt.command_id] if receipt.command_id else [],
+      "decisions": [decision("finish_then_charge", **receipt.to_dict())],
     }
 
   async def interrupt_and_charge(state: WorkflowState) -> dict:
@@ -184,26 +179,29 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     if hasattr(mid, "hex"):  # UUID → str
       mid = str(mid)
 
-    await db.update_mission_status(pool, mid, "paused")
-    command_id = await db.insert_agent_command(
+    pause_receipt = await tools.pause_mission(
+      pool, mission_id=mid, reason="battery_low_interrupt",
+    )
+    nav_receipt = await tools.navigate_to(
       pool,
       robot_id=state["event"]["robot_id"],
-      source_agent="charging_workflow",
-      command_type="navigate_to",
-      payload={
-        "destination_shelf_id": charger["shelf_id"],
-        "x": charger["x"],
-        "y": charger["y"],
-        "reason": "battery_low but not enough to finish",
-      },
-      priority=10,
+      destination_shelf_id=charger["shelf_id"],
+      reason="battery_low_interrupt",
+      urgency="critical",
+      issued_by="charging_workflow",
     )
-
-    await audit_checkpoint(pool, state["workflow_id"], "interrupt_and_charge", {"command_id": command_id})
+    await audit_checkpoint(pool, state["workflow_id"], "interrupt_and_charge", {
+      "pause":    pause_receipt.to_dict(),
+      "navigate": nav_receipt.to_dict(),
+    })
     return {
-      "commands_issued": [command_id],
+      "commands_issued":  [nav_receipt.command_id] if nav_receipt.command_id else [],
       "paused_mission_id": mid,
-      "decisions": [decision("interrupt_and_charge", command_id=command_id, target=charger["shelf_id"])],
+      "decisions": [decision(
+        "interrupt_and_charge",
+        pause=pause_receipt.to_dict(),
+        navigate=nav_receipt.to_dict(),
+      )],
     }
 
   async def finalize(state: WorkflowState) -> dict:

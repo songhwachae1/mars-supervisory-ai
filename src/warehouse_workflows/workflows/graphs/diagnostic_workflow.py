@@ -24,7 +24,7 @@ import logging
 import asyncpg
 from langgraph.graph import StateGraph, END
 
-from workflows import db, terminal
+from workflows import terminal, tools
 from workflows.graphs._shared import decision, audit_checkpoint
 from workflows.state import WorkflowState
 
@@ -35,7 +35,7 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
 
   async def record_anomaly(state: WorkflowState) -> dict:
     event = state["event"]
-    anomaly_id = await db.insert_anomaly(
+    receipt = await tools.record_anomaly(
       pool,
       robot_id=event["robot_id"],
       anomaly_type=event["event_type"],
@@ -49,43 +49,39 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
         "event_payload":  event.get("payload"),
       },
     )
-    await audit_checkpoint(pool, state["workflow_id"], "record_anomaly", {"anomaly_id": anomaly_id})
+    await audit_checkpoint(pool, state["workflow_id"], "record_anomaly", receipt.to_dict())
     return {
-      "anomaly_id": anomaly_id,
-      "decisions": [decision("record_anomaly", anomaly_id=anomaly_id)],
+      "anomaly_id": receipt.meta["anomaly_id"],
+      "decisions":  [decision("record_anomaly", **receipt.to_dict())],
     }
 
   async def pause_robot(state: WorkflowState) -> dict:
-    command_id = await db.insert_agent_command(
+    receipt = await tools.pause_robot(
       pool,
       robot_id=state["event"]["robot_id"],
-      source_agent="diagnostic_workflow",
-      command_type="pause_robot",
-      payload={"reason": state["event"]["event_type"]},
-      priority=20,  # safety > everything else
+      reason=state["event"]["event_type"],
+      issued_by="diagnostic_workflow",
     )
-    await audit_checkpoint(pool, state["workflow_id"], "pause_robot", {"command_id": command_id})
+    await audit_checkpoint(pool, state["workflow_id"], "pause_robot", receipt.to_dict())
     return {
-      "commands_issued": [command_id],
-      "decisions": [decision("pause_robot", command_id=command_id)],
+      "commands_issued": [receipt.command_id] if receipt.command_id else [],
+      "decisions": [decision("pause_robot", **receipt.to_dict())],
     }
 
   async def request_intervention(state: WorkflowState) -> dict:
-    intervention_id = await db.insert_anomaly(
+    event = state["event"]
+    receipt = await tools.flag_for_intervention(
       pool,
-      robot_id=state["event"]["robot_id"],
-      anomaly_type="needs_human_intervention",
-      severity="critical",
-      detected_by="diagnostic_workflow",
-      related_event_id=state["event"]["event_id"],
+      robot_id=event["robot_id"],
+      related_event_id=event["event_id"],
       description=(
-        f"Diagnostic workflow halted {state['event']['robot_id']} due to "
-        f"{state['event']['event_type']}. Manual review required."
+        f"Diagnostic workflow halted {event['robot_id']} due to "
+        f"{event['event_type']}. Manual review required."
       ),
       state_snapshot={"linked_anomaly_id": state.get("anomaly_id")},
     )
-    await audit_checkpoint(pool, state["workflow_id"], "request_intervention", {"intervention_id": intervention_id})
-    return {"decisions": [decision("request_intervention", intervention_id=intervention_id)]}
+    await audit_checkpoint(pool, state["workflow_id"], "request_intervention", receipt.to_dict())
+    return {"decisions": [decision("request_intervention", **receipt.to_dict())]}
 
   async def finalize(state: WorkflowState) -> dict:
     await terminal.mark_workflow_completed(pool, state["workflow_id"], "finalize")

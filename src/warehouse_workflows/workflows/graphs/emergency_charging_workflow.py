@@ -24,7 +24,7 @@ import logging
 import asyncpg
 from langgraph.graph import StateGraph, END
 
-from workflows import db, terminal
+from workflows import db, terminal, tools
 from workflows.graphs._shared import decision, audit_checkpoint
 from workflows.state import WorkflowState
 
@@ -61,36 +61,30 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     if hasattr(mid, "hex"):  # UUID → str
       mid = str(mid)
 
-    await db.update_mission_status(pool, mid, "paused")
-    await audit_checkpoint(pool, state["workflow_id"], "pause_mission", {"mission_id": mid})
+    receipt = await tools.pause_mission(pool, mission_id=mid, reason="battery_critical")
+    await audit_checkpoint(pool, state["workflow_id"], "pause_mission", receipt.to_dict())
     return {
       "paused_mission_id": mid,
-      "decisions": [decision("pause_mission", mission_id=mid)],
+      "decisions": [decision("pause_mission", **receipt.to_dict())],
     }
 
   async def issue_navigate(state: WorkflowState) -> dict:
     charger = state.get("selected_charger")
     if charger is None:
-      # select_charger already set error; nothing more to do here.
       return {"decisions": [decision("issue_navigate", action="skipped_no_charger")]}
 
-    command_id = await db.insert_agent_command(
+    receipt = await tools.navigate_to(
       pool,
       robot_id=state["event"]["robot_id"],
-      source_agent="emergency_charging_workflow",
-      command_type="navigate_to",
-      payload={
-        "destination_shelf_id": charger["shelf_id"],
-        "x": charger["x"],
-        "y": charger["y"],
-        "reason": "battery_critical",
-      },
-      priority=10,  # high
+      destination_shelf_id=charger["shelf_id"],
+      reason="battery_critical",
+      urgency="critical",
+      issued_by="emergency_charging_workflow",
     )
-    await audit_checkpoint(pool, state["workflow_id"], "issue_navigate", {"command_id": command_id})
+    await audit_checkpoint(pool, state["workflow_id"], "issue_navigate", receipt.to_dict())
     return {
-      "commands_issued": [command_id],
-      "decisions": [decision("issue_navigate", command_id=command_id, target=charger["shelf_id"])],
+      "commands_issued": [receipt.command_id] if receipt.command_id else [],
+      "decisions": [decision("issue_navigate", **receipt.to_dict())],
     }
 
   async def finalize(state: WorkflowState) -> dict:

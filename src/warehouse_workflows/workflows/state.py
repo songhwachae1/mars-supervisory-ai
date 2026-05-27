@@ -35,7 +35,7 @@ class WorkflowState(TypedDict, total=False):
   assigned_mission_id: Optional[str]
   anomaly_id:         Optional[str]
   blockage_type:      Optional[str]   # 'transient' | 'chronic'
-  reroute_target:     Optional[dict]  # {destination_shelf_id, x, y, recovery_attempt}
+  reroute_target:     Optional[dict]  # {destination_shelf_id, recovery_attempt}
 
   # ── Terminal ──
   status: str                  # 'completed' | 'failed' (set by finalize)

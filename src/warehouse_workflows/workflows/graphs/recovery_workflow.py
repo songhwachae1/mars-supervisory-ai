@@ -7,8 +7,8 @@ Triggered by:
 
 Nodes:
   assess_blockage  → classify transient vs chronic; insert anomaly for chronic
-  plan_reroute     → resolve destination + recovery_attempt counter → reroute_target
-  issue_reroute    → write navigate_to command from reroute_target
+  plan_reroute     → package reroute intent (destination + recovery_attempt counter)
+  issue_reroute    → call navigate_to tool with reroute intent
   finalize         → mark workflow_execution completed/failed
 
 To activate, add to workflows/registry.py:
@@ -20,7 +20,7 @@ import logging
 import asyncpg
 from langgraph.graph import END, StateGraph
 
-from workflows import db, terminal
+from workflows import db, terminal, tools
 from workflows.graphs._shared import audit_checkpoint, decision
 from workflows.state import WorkflowState
 
@@ -33,15 +33,14 @@ RECURRENCE_THRESHOLD = 2    # 3rd hit (this one + 2 prior) → escalate
 def build_graph(pool: asyncpg.Pool) -> StateGraph:
 
   async def assess_blockage(state: WorkflowState) -> dict:
-		robot_state = state.get("robot_state") or {}
-    robot_id = robot_state.get("robot_id")
+    robot_id = (state.get("robot_state") or {}).get("robot_id")
     event    = state["event"]
     event_id = event["event_id"]
 
     event_summ = await db.count_recent_blockage_events(pool, robot_id, BLOCKAGE_WINDOW_S, event_id)
     if event_summ["event_count"] >= RECURRENCE_THRESHOLD:
       block_type = "chronic"
-      anomaly_id = await db.insert_anomaly(
+      receipt = await tools.record_anomaly(
         pool,
         robot_id=robot_id,
         anomaly_type="chronic_blockage",
@@ -56,18 +55,13 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
         },
       )
       await audit_checkpoint(pool, state["workflow_id"], "assess_blockage", {
-        "anomaly_id":    str(anomaly_id),
-        "event_count":   event_summ["event_count"],
         "blockage_type": block_type,
+        **receipt.to_dict(),
       })
       return {
         "blockage_type": block_type,
-        "anomaly_id": str(anomaly_id),
-        "decisions": [decision(
-          "assess_blockage",
-          blockage_type=block_type,
-          anomaly_id=str(anomaly_id),
-        )],
+        "anomaly_id":    receipt.meta["anomaly_id"],
+        "decisions": [decision("assess_blockage", blockage_type=block_type, **receipt.to_dict())],
       }
 
     block_type = "transient"
@@ -79,8 +73,9 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
 
   async def plan_reroute(state: WorkflowState) -> dict:
     """
-    Deterministic v1: re-target the same destination with recovery_attempt = N+1.
-    Sets reroute_target so issue_reroute can read it without redundant DB calls.
+    Package reroute intent: same destination, incremented recovery_attempt.
+    Coordinate resolution is the tool's responsibility — this node only
+    confirms the intent can be formed (mission + destination exist in state).
 
     TODO: replace with NavigationAgent call when the agent is available.
           Agent signature: (current_pose, destination, obstacle_zone) → waypoint list.
@@ -89,7 +84,7 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     if mission is None:
       await audit_checkpoint(pool, state["workflow_id"], "plan_reroute", {"reason": "no_mission_available"})
       return {
-        "error": "no_mission_available",
+        "error":   "no_mission_available",
         "decisions": [decision("plan_reroute", reason="no_mission_available")],
       }
 
@@ -97,25 +92,13 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     if dest_shelf is None:
       await audit_checkpoint(pool, state["workflow_id"], "plan_reroute", {"reason": "no_destination_in_mission"})
       return {
-        "error": "no_destination_in_mission",
+        "error":   "no_destination_in_mission",
         "decisions": [decision("plan_reroute", reason="no_destination_in_mission")],
       }
 
-    dest = await db.find_location(pool, dest_shelf)
-    if dest is None:
-      await audit_checkpoint(pool, state["workflow_id"], "plan_reroute",
-                             {"reason": "unknown_destination", "shelf_id": dest_shelf})
-      return {
-        "error": "unknown_destination",
-        "decisions": [decision("plan_reroute", reason="unknown_destination", shelf_id=dest_shelf)],
-      }
-		
-    r_event = state["event"].get("payload") or {}
-		prior_attempt = r_event.get("recovery_attempt", 0)
+    prior_attempt = (state["event"].get("payload") or {}).get("recovery_attempt", 0)
     reroute_target = {
       "destination_shelf_id": dest_shelf,
-      "x":                    dest["x"],
-      "y":                    dest["y"],
       "recovery_attempt":     prior_attempt + 1,
     }
 
@@ -129,14 +112,14 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     reroute_target = state.get("reroute_target")
     if reroute_target is None:
       return {
-        "error": "no_reroute_target",
+        "error":   "no_reroute_target",
         "decisions": [decision("issue_reroute", reason="no_reroute_target")],
       }
 
     mission = state.get("active_mission")
     if mission is None:
       return {
-        "error": "no_mission_available",
+        "error":   "no_mission_available",
         "decisions": [decision("issue_reroute", reason="no_mission_available")],
       }
 
@@ -144,29 +127,33 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     if hasattr(mid, "hex"):  # UUID → str
       mid = str(mid)
 
-    await db.update_mission_status(pool, mid, "pending")
-    command_id = await db.insert_agent_command(
+    resume_receipt = await tools.resume_mission(pool, mission_id=mid)
+    nav_receipt = await tools.navigate_to(
       pool,
       robot_id=state["event"]["robot_id"],
-      source_agent="recovery_workflow",
-      command_type="navigate_to",
-      payload={
-        "destination_shelf_id": reroute_target["destination_shelf_id"],
-        "x":                    reroute_target["x"],
-        "y":                    reroute_target["y"],
-        "recovery_attempt":     reroute_target["recovery_attempt"],
-        "reason":               "transient blockage, rerouting",
-      },
-      priority=8,
+      destination_shelf_id=reroute_target["destination_shelf_id"],
+      reason="transient_blockage",
+      urgency="recovery",
+      recovery_attempt=reroute_target["recovery_attempt"],
+      issued_by="recovery_workflow",
     )
-    await audit_checkpoint(pool, state["workflow_id"], "issue_reroute", {"command_id": command_id})
+
+    if not nav_receipt.accepted:
+      return {
+        "error":   nav_receipt.rejection_reason,
+        "decisions": [decision("issue_reroute", resume=resume_receipt.to_dict(), navigate=nav_receipt.to_dict())],
+      }
+
+    await audit_checkpoint(pool, state["workflow_id"], "issue_reroute", {
+      "resume":   resume_receipt.to_dict(),
+      "navigate": nav_receipt.to_dict(),
+    })
     return {
-      "commands_issued": [command_id],
+      "commands_issued": [nav_receipt.command_id],
       "decisions": [decision(
         "issue_reroute",
-        command_id=command_id,
-        target=reroute_target["destination_shelf_id"],
-        recovery_attempt=reroute_target["recovery_attempt"],
+        resume=resume_receipt.to_dict(),
+        navigate=nav_receipt.to_dict(),
       )],
     }
 
@@ -199,7 +186,7 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
 
   graph.set_entry_point("assess_blockage")
   graph.add_conditional_edges("assess_blockage", route_after_assess, {
-    "finalize":    "finalize",
+    "finalize":     "finalize",
     "plan_reroute": "plan_reroute",
   })
   graph.add_conditional_edges("plan_reroute", route_after_plan, {

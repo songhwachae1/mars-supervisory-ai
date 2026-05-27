@@ -183,20 +183,6 @@ The Context Aggregator:
 
 ---
 
-## Recommended Architecture
-
-```text
-aggregator/
- ├── aggregator_node.py
- ├── battery_monitor.py
- ├── navigation_monitor.py
- ├── event_detector.py
- ├── db_writer.py
- ├── state_cache.py
- └── schemas/
-```
-
----
 
 ## Example Semantic Transformations
 
@@ -359,20 +345,6 @@ The orchestrator:
 
 ---
 
-## Orchestrator Structure
-
-```text
-orchestrator/
- ├── graph.py
- ├── state.py
- ├── event_router.py
- ├── workflow_manager.py
- ├── checkpoint_manager.py
- ├── recovery_manager.py
- └── agents/
-```
-
----
 
 ## Example Workflow
 

@@ -21,7 +21,7 @@ import logging
 import asyncpg
 from langgraph.graph import StateGraph, END
 
-from workflows import db, terminal
+from workflows import db, terminal, tools
 from workflows.graphs._shared import decision, audit_checkpoint
 from workflows.state import WorkflowState
 
@@ -37,11 +37,11 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
       return {"decisions": [decision("complete_current_task", action="skipped_no_task")]}
 
     task_id_s = str(task_id)
-    await db.complete_task(pool, task_id_s)
-    await audit_checkpoint(pool, state["workflow_id"], "complete_current_task", {"task_id": task_id_s})
+    receipt = await tools.complete_task(pool, task_id=task_id_s)
+    await audit_checkpoint(pool, state["workflow_id"], "complete_current_task", receipt.to_dict())
     return {
       "completed_task_id": task_id_s,
-      "decisions": [decision("complete_current_task", task_id=task_id_s)],
+      "decisions": [decision("complete_current_task", **receipt.to_dict())],
     }
 
   async def advance_mission(state: WorkflowState) -> dict:
@@ -53,17 +53,20 @@ def build_graph(pool: asyncpg.Pool) -> StateGraph:
     next_task = await db.find_next_task(pool, mid)
 
     if next_task is None:
-      # No more tasks → mission is done.
-      await db.complete_mission(pool, mid)
-      await audit_checkpoint(pool, state["workflow_id"], "advance_mission", {"mission_completed": mid})
-      return {"decisions": [decision("advance_mission", mission_completed=mid)]}
+      receipt = await tools.complete_mission(pool, mission_id=mid)
+      await audit_checkpoint(pool, state["workflow_id"], "advance_mission", receipt.to_dict())
+      return {"decisions": [decision("advance_mission", **receipt.to_dict())]}
 
     next_id = str(next_task["task_id"])
-    await db.activate_task(pool, next_id)
-    await audit_checkpoint(pool, state["workflow_id"], "advance_mission", {"activated_task": next_id})
+    receipt = await tools.activate_task(pool, task_id=next_id)
+    await audit_checkpoint(pool, state["workflow_id"], "advance_mission", receipt.to_dict())
     return {
       "next_task_id": next_id,
-      "decisions": [decision("advance_mission", activated_task=next_id, sequence=next_task.get("sequence_order"))],
+      "decisions": [decision(
+        "advance_mission",
+        **receipt.to_dict(),
+        sequence=next_task.get("sequence_order"),
+      )],
     }
 
   async def finalize(state: WorkflowState) -> dict:
