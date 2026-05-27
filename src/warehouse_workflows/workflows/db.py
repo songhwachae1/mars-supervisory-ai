@@ -11,6 +11,7 @@ consistent and parameter order stable.
 """
 
 import json
+import uuid
 from typing import Optional
 
 import asyncpg
@@ -152,25 +153,19 @@ async def insert_anomaly(
 # Helpers
 # ─────────────────────────────────────────────
 async def count_recent_blockage_events(
-	pool: asyncpg.Pool,
-	robot_id: str, 
-	window_s: int,
-	exclude_event_id: int
+  pool: asyncpg.Pool,
+  robot_id: str,
+  window_s: int,
+  exclude_event_id: int,
 ) -> dict:
   async with pool.acquire() as conn:
     row = await conn.fetchrow(
       queries.COUNT_RECENT_BLOCKAGE_EVENTS,
       robot_id,
       str(window_s),
-      exclude_event_id
+      exclude_event_id,
     )
-
-	return _row_to_dict(row)
-
-
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+  return _row_to_dict(row)
 
 def _row_to_dict(row) -> Optional[dict]:
   if row is None:
@@ -179,6 +174,8 @@ def _row_to_dict(row) -> Optional[dict]:
   for key, value in row.items():
     if hasattr(value, "isoformat"):
       out[key] = value.isoformat()
+    elif isinstance(value, uuid.UUID) or type(value).__name__ == "UUID":
+      out[key] = str(value)
     elif isinstance(value, str) and key in ("metadata", "payload"):
       try:
         out[key] = json.loads(value)

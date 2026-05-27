@@ -17,6 +17,7 @@ The builder reads, does not write.
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -70,6 +71,8 @@ def _row_to_dict(row) -> Optional[dict]:
   for key, value in row.items():
     if isinstance(value, datetime):
       out[key] = value.isoformat()
+    elif isinstance(value, uuid.UUID) or type(value).__name__ == "UUID":
+      out[key] = str(value)
     elif isinstance(value, str) and key in ("metadata", "payload"):
       # JSONB may arrive as str depending on codec config.
       try:
