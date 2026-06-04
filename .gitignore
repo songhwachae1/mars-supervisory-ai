@@ -6,4 +6,3 @@ log/
 *.egg-info/
 __pycache__/
 .claude
-config.py

@@ -1,1 +1,0 @@
-from event_system.severity.classifier import SeverityClassifier

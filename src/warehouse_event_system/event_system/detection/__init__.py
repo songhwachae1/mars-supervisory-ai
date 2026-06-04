@@ -1,2 +1,0 @@
-from event_system.detection.detector import StateTransitionDetector
-from event_system.detection.rules import DETECTION_RULES
