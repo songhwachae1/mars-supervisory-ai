@@ -155,6 +155,8 @@ The Router, fast path, and Failure Analysis Agent all assume two things exist on
 
 This is the single owner of the "cheap signals" the Router reads in §2.
 
+> **Ingest-time persistence + coalescing (revised).** The Aggregator is the ingest layer: on every failure it (a) **persists the `failures` row and commits immediately** — decoupled from analysis, so the investigator's read-only connection sees committed data and a burst is never lost to slow analysis — and (b) updates the HotState distribution counters. It then runs the deterministic Router (§2). **Fast-path** failures act immediately. **Slow-path** failures are *not* analyzed one-by-one: they enter a **per-zone correlation window** (`COALESCE_WINDOW_SECONDS`, debounce — each new slow failure in the zone extends it), and when the zone goes quiet one **single** analysis event is emitted for that zone. A burst of K robots in a zone therefore yields K persisted rows but **one** investigation → one diagnosis → one strategy run → one policy. Different zones coalesce independently. The investigator (contracts §1) then queries the now-fully-populated failures table for the zone. Persistence is never coalesced — only the analysis is.
+
 ### Two independent axes
 
 A failure must be classified on two axes that are easy to conflate:
@@ -344,6 +346,8 @@ float32 estimated_energy_pct
 
 Sits between Orchestrator and the recovery workflows. Uses only cheap structured signals already maintained by the Aggregator (§1a). Its single job is **path selection**, not diagnosis.
 
+> **Runs at ingest (revised).** Because routing is cheap and deterministic, it runs per failure at ingest (§1a). Fast-path failures act immediately; slow-path failures feed the per-zone coalescing window, so the routing decision is per-failure but the slow *investigation* is per-zone-burst.
+
 ### Signals it reads (all cheap, all deterministic — sourced from §1a)
 
 ```text
@@ -398,6 +402,8 @@ ROS Executor
 No LLM, no RAG. Sub-second disposition. The fast path has a **retry budget**; exceeding it forces the slow path so it can never silently mask a real problem by retrying forever.
 
 ### Slow path (pattern detected, repeated failure, or fast-path ambiguity)
+
+> **Coalesced per zone (revised).** Slow-path failures are not investigated one-by-one. They enter the per-zone correlation window from §1a; one analysis runs per zone-burst, over the fully-persisted failures. The provisional safe action below still applies per failure at ingest; it's the *investigation* (and everything downstream of it) that fires once per zone.
 
 ```text
 navigation.aborted ──► Router ──► SLOW
@@ -522,6 +528,8 @@ This is where the v1 ambiguity ("does the trigger evaluate both jointly or indep
 ## 4. Retrieval Validator (new — formalizes your design)
 
 Gates whether the agent is allowed to trust retrieved precedent. Runs **per result**, then over the **result set**.
+
+> **Where it runs depends on the agent style.** For single-shot agents (Strategy, Fleet) it runs once as a pre-stage on the assembled precedent set. For the **read-only ReAct investigator** (Failure Analysis, see contracts doc §1) it runs **inside the `search_incidents` tool** — fired on each retrieval the agent makes, annotating every result with `trust`. Same scoring either way; only the call site differs.
 
 ### Per-result dimensions
 
@@ -662,6 +670,8 @@ LIVENESS        all critical / HIGH-priority missions remain feasible
 
 This is where "avoid_zone the only corridor to the chargers" gets caught and rejected.
 
+> **Cumulative blast-radius (revised).** Reachability/charging are checked over the **union of all currently active `avoid_zone`s plus the proposal**, not the proposal alone — several individually-safe avoidances can collectively strand robots from every charger, which a per-policy check misses. A cap (`MAX_ACTIVE_AVOID_ZONES`) bounds how many zones may be avoided at once; hitting it is treated as a **fleet-wide signal** (escalate to fleet-wide handling / operator) rather than silently stacking another avoidance.
+
 ### Stage 5 — Conflict resolution / precedence
 ```text
 compare against currently ACTIVE policies:
@@ -684,6 +694,7 @@ normalize/round expiry timestamps
 prevent thrash: a policy on entity X cannot be re-applied/flipped within
 COOLDOWN of its last change; require minimum dwell time before reversal
 ```
+> **Per-`(type, zone)` cooldown (revised).** The cooldown key is `(policy_type, zone)`, not `policy_type` alone — otherwise an `avoid_zone` for one zone wrongly blocks a legitimate `avoid_zone` for a *different* zone. Same zone is still rate-limited across bursts; distinct zones are independent.
 
 ### Per-policy outcome
 ```text
@@ -904,4 +915,15 @@ The Aggregator updates hot state continuously; only events and resolved records 
 + Hot state separated from analytical/vector store
 + Topic->field mapping pinned to Isaac Sim + Nav2 Humble; outcome from GoalStatus (result empty)
 + Custom mars_msgs interfaces: RobotHealth (build) + optional MissionCommand/Status, MissionFeasible.srv
+```
+
+### Post-implementation revisions
+```text
+~ Failures persisted at INGEST (write+commit in the aggregator), decoupled from analysis
+~ Slow-path analysis COALESCED per zone (correlation window): one burst -> one investigation
+  -> one diagnosis -> one strategy run -> one policy; persistence is never coalesced
+~ Router runs at ingest; fast path immediate, only the slow investigation is per-zone-burst
+~ Guardrail cooldown keyed on (type, zone), not type (frees distinct zones)
+~ Guardrail reachability/charging checked CUMULATIVELY over active avoid_zones + proposal;
+  MAX_ACTIVE_AVOID_ZONES cap -> fleet-wide escalation instead of stacking avoidances
 ```

@@ -125,6 +125,12 @@ POLICY_WHITELIST: list[str] = [
 POLICY_MAX_DURATION_SEC: int = int(os.environ.get("POLICY_MAX_DURATION_SEC", "7200"))
 POLICY_MIN_DURATION_SEC: int = int(os.environ.get("POLICY_MIN_DURATION_SEC", "60"))
 POLICY_COOLDOWN_SEC: int = int(os.environ.get("POLICY_COOLDOWN_SEC", "120"))
+# Max simultaneously active avoid_zone policies; hitting the cap escalates
+# to operator rather than stacking another zone avoidance.
+MAX_ACTIVE_AVOID_ZONES: int = int(os.environ.get("MAX_ACTIVE_AVOID_ZONES", "3"))
+# Coalescing debounce window: slow-path failures in the same zone extend this
+# window; when the zone goes quiet, ONE investigation is emitted.
+COALESCE_WINDOW_SECONDS: float = float(os.environ.get("COALESCE_WINDOW_SECONDS", "1.0"))
 
 # ---------------------------------------------------------------------------
 # Fleet monitoring

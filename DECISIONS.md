@@ -186,3 +186,35 @@ The Failure Analysis Agent was refactored from a single-shot LLM call with a pre
 | Output contract | **Unchanged** | Same diagnosis dict shape; `slow_disposition()`, Strategy Trigger Rules, and all downstream consumers are unmodified. |
 
 **Vertical slice verification:** synthetic failure → router (SLOW) → investigator calls `query_failures` tool → transcript populated → diagnosis → DV grounds refs against transcript → PASS → strategy trigger → guardrail → avoid_zone activated → scheduler defers dock missions. All 125 tests pass.
+
+---
+
+## 16. Persist-at-Ingest + Coalesced Slow-Path Analysis (2026-06-05)
+
+### Where the failure write now lives
+
+Failures are written and committed **at ingest** (in `demo.py`'s `on_failure_event` callback), not inside `orchestrator.handle_failure`. The `failure_id` is stamped onto the event before routing so downstream consumers never need to write it. This fixes the dropped-rows bug: all K failures in a burst are persisted regardless of whether they trigger analysis.
+
+### Coalescing design
+
+| Decision | Value | Rationale |
+|----------|-------|-----------|
+| `COALESCE_WINDOW_SECONDS` | `1.0` s | Short enough to feel responsive; long enough to collect a burst of 4 near-simultaneous aborts from one zone. Tunable via env. |
+| Debounce semantics | Each new slow failure in a zone extends the timer | Classic debounce: window closes only after the zone goes quiet, not after a fixed delay from the first failure. |
+| Per-zone keying | `ZoneCoalescer` in `mars/orchestrator/coalescer.py` | Zones coalesce independently — R5 in zone B gets its own window and its own analysis; zone A's analysis never delays it. |
+| Fast path | Immediate, no window | Fault-flag/first-retry failures still fire at once; the window only gates the investigator (the expensive part). |
+| Representative trigger | Latest failure in the zone's buffer | Latest = most current health snapshot. The diagnosis FK attaches to this `failure_id`; other burst failures remain as `failures` rows without a diagnosis (spec-correct). |
+| One analysis per zone-burst | `ZoneCoalescer` → one `handle_slow_analysis` call | K failures → K `failures` rows; one investigation → one `diagnoses` row → one `strategy_runs` row → one policy. |
+
+### Orchestrator split
+
+`handle_failure(event, conn)` — fast-path only (reads `failure_id` off the event; no write).
+`handle_slow_analysis(trigger_event, conn)` — coalesced slow path; called once per zone-burst by the processing loop.
+
+### Guardrail changes
+
+| Decision | Value | Rationale |
+|----------|-------|-----------|
+| Cooldown key | `(policy_type, zone)` tuple | Same zone is rate-limited across bursts; different zones are independent. Stored in `PolicyManager._last_applied`. |
+| Cumulative avoid_zone guard | Union of active + proposed avoid_zones | Per-policy reachability check was insufficient for multi-zone bursts (each passes individually while together stranding robots). |
+| `MAX_ACTIVE_AVOID_ZONES` | `3` | Cap on simultaneous avoid_zone policies; hitting it defers to operator via `DEFER_HUMAN` rather than stacking another avoidance. |

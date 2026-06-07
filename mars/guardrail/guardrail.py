@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any
 
 from mars.config import (
+    MAX_ACTIVE_AVOID_ZONES,
     POLICY_COOLDOWN_SEC,
     POLICY_MAX_DURATION_SEC,
     POLICY_MIN_DURATION_SEC,
@@ -90,10 +91,12 @@ def check(
         notes.append(f"HIGH impact policy requires elevated confidence or operator approval")
         return GuardrailResult.DEFER_HUMAN, modified, "; ".join(notes)
 
-    # Stage 4 — Feasibility / safety invariants
-    result, feas_notes = _feasibility_check(policy, world_state)
+    # Stage 4 — Feasibility / safety invariants (per-policy + cumulative)
+    result, feas_notes = _feasibility_check(policy, active_policies, world_state)
     if result == GuardrailResult.REJECT:
         return GuardrailResult.REJECT, modified, feas_notes
+    if result == GuardrailResult.DEFER_HUMAN:
+        return GuardrailResult.DEFER_HUMAN, modified, feas_notes
     notes.extend([feas_notes] if feas_notes else [])
 
     # Stage 5 — Conflict resolution
@@ -114,11 +117,17 @@ def check(
     modified["expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=dur)
 
     # Stage 7 — Rate limiting / hysteresis
+    # Cooldown is keyed on (type, zone) so the same zone is rate-limited across
+    # bursts while different zones remain independent.
     if last_applied:
         import time
-        last = last_applied.get(p_type, 0)
+        zone_for_key = policy.get("params", {}).get("zone")
+        cooldown_key = (p_type, zone_for_key) if zone_for_key else p_type
+        last = last_applied.get(cooldown_key, 0)
         if time.time() - last < POLICY_COOLDOWN_SEC:
-            return GuardrailResult.REJECT, modified, f"cooldown: {p_type} applied < {POLICY_COOLDOWN_SEC}s ago"
+            return GuardrailResult.REJECT, modified, (
+                f"cooldown: {p_type} zone={zone_for_key!r} applied < {POLICY_COOLDOWN_SEC}s ago"
+            )
 
     final_result = GuardrailResult.MODIFY if notes else GuardrailResult.ACCEPT
     log.info("[guardrail] %s → %s  notes=%s", p_type, final_result, notes)
@@ -126,53 +135,80 @@ def check(
 
 
 def _feasibility_check(
-    policy: dict[str, Any], world_state: dict[str, Any]
+    policy: dict[str, Any],
+    active_policies: list[dict[str, Any]],
+    world_state: dict[str, Any],
 ) -> tuple[GuardrailResult, str]:
     """
     Stage 4: ensure the policy doesn't violate global invariants.
 
-    Critical check for this build:
-      avoid_zone must not block ALL paths to chargers.
+    Two layers:
+      Per-policy:  avoid_zone must not immediately strand robots from chargers.
+      Cumulative:  union of active + proposed avoid_zones must not block charger
+                   access or exceed MAX_ACTIVE_AVOID_ZONES.
     """
     if not world_state:
         return GuardrailResult.ACCEPT, ""
 
     p_type = policy.get("type", "")
-    zone = policy.get("params", {}).get("zone")
+    zone   = policy.get("params", {}).get("zone")
 
     if p_type == "avoid_zone" and zone:
         charger_zones = world_state.get("charger_zones", [])
-        zones = world_state.get("zones", {})
+        zones         = world_state.get("zones", {})
 
-        # Check if every charger zone is reachable only through the avoided zone
-        # (simplified: reject if the only charger zone IS the avoided zone)
         charger_zone_ids = [
             zid for zid, zdata in zones.items()
             if zdata.get("is_charger_zone") or zid in charger_zones
         ]
+
+        # Per-policy: reject if this single zone is the only charger zone
         if charger_zone_ids and all(czid == zone for czid in charger_zone_ids):
             return (
                 GuardrailResult.REJECT,
                 f"avoid_zone {zone!r} would strand all robots from chargers",
             )
 
-        # Check mandatory zones
-        mandatory_zones = [
-            zid for zid, zdata in zones.items() if zdata.get("is_mandatory")
-        ]
+        # Per-policy: reject mandatory zones
+        mandatory_zones = [zid for zid, zd in zones.items() if zd.get("is_mandatory")]
         if zone in mandatory_zones:
             return (
                 GuardrailResult.REJECT,
                 f"avoid_zone {zone!r} is a mandatory zone — cannot be avoided",
             )
 
+        # Cumulative: collect all currently active avoid_zones + proposed
+        active_avoid = {
+            p.get("params", {}).get("zone")
+            for p in active_policies
+            if p.get("type") == "avoid_zone" and p.get("params", {}).get("zone")
+        }
+        active_avoid.add(zone)
+
+        # MAX_ACTIVE_AVOID_ZONES cap: too many concurrent avoidances signals
+        # a fleet-wide problem → escalate rather than stacking another policy
+        if len(active_avoid) > MAX_ACTIVE_AVOID_ZONES:
+            return (
+                GuardrailResult.DEFER_HUMAN,
+                f"avoid_zone count {len(active_avoid)} > MAX_ACTIVE_AVOID_ZONES="
+                f"{MAX_ACTIVE_AVOID_ZONES}: escalate to fleet-wide handling",
+            )
+
+        # Cumulative charger reachability: any charger zone still accessible?
+        if charger_zone_ids:
+            reachable = [czid for czid in charger_zone_ids if czid not in active_avoid]
+            if not reachable:
+                return (
+                    GuardrailResult.REJECT,
+                    f"cumulative avoid_zones {sorted(active_avoid)!r} would block "
+                    "all charger access",
+                )
+
     # Charging viability — reserve_chargers_for_critical must leave at least
-    # one charger available for normal (non-critical) robots.  If the fleet
-    # has N chargers and we reserve N, normal robots can never charge, which
-    # violates the liveness invariant (§6 Stage 4).
+    # one charger available for normal (non-critical) robots.
     if p_type == "reserve_chargers_for_critical":
-        reserve_count   = int(policy.get("params", {}).get("reserve_count", 1))
-        total_chargers  = world_state.get("total_chargers", 0)
+        reserve_count  = int(policy.get("params", {}).get("reserve_count", 1))
+        total_chargers = world_state.get("total_chargers", 0)
         if total_chargers > 0 and reserve_count >= total_chargers:
             return (
                 GuardrailResult.REJECT,

@@ -43,6 +43,8 @@ class DVResult(str, Enum):
     REJECT  = "REJECT"
 
 
+import re as _re
+
 _MISSING = object()  # sentinel: field does not exist
 
 
@@ -84,6 +86,67 @@ def _resolve_ref(ref: str, bundle: dict[str, Any]) -> bool:
     return True                   # path exists; value may be None
 
 
+def _retrieved_precedent_ids(bundle: dict) -> set[str]:
+    """
+    Return the set of stable IDs from the bundle's `retrieved_precedents` list.
+    Only IDs that were actually retrieved are in this set — fabricated IDs never
+    appear here, preserving the hallucination guard.
+    """
+    return {
+        p["id"]
+        for p in (bundle.get("retrieved_precedents") or [])
+        if isinstance(p, dict) and p.get("id")
+    }
+
+
+def _ref_grounded(ref: str, bundle: dict) -> bool:
+    """
+    A ref is grounded if it is either:
+      - a JSON-path that resolves against the bundle, OR
+      - a retrieved-precedent ID that the agent actually received.
+
+    Citing a precedent by stable ID (e.g. "DX157601ead162") is a *better*
+    reference than a positional one (which breaks if the list reorders), and
+    is already consistent with how `relied_on_precedents` uses IDs.  Only
+    IDs present in `retrieved_precedents` are accepted — unknown IDs still fail.
+    """
+    if ref in _retrieved_precedent_ids(bundle):
+        return True
+    return _resolve_ref(ref, bundle)
+
+
+def _referenced_robot_ids(evidence: list[dict], bundle: dict) -> set[str]:
+    """
+    For each evidence ref that targets `mission_failures`, resolve it to the
+    robot_id(s) it points at and return the set of distinct robot IDs.
+
+    Handles:
+      "mission_failures"        → all robots in the array
+      "mission_failures[N]"     → robot at index N
+      "mission_failures[N].foo" → robot at index N (field suffix ignored)
+
+    Out-of-range indices and missing robot_id fields contribute nothing —
+    the grounding check already flags truly unresolvable refs separately.
+    """
+    mf = bundle.get("mission_failures") or []
+    robots: set[str] = set()
+    for item in evidence:
+        for ref in item.get("refs", []):
+            if not ref.startswith("mission_failures"):
+                continue
+            m = _re.match(r"mission_failures(?:\[(\d+)\])?", ref)
+            if m is None:
+                continue
+            idx = m.group(1)
+            if idx is None:                        # bare array ref → all robots
+                robots.update(e.get("robot_id") for e in mf if e.get("robot_id"))
+            else:                                  # mission_failures[i] (+ optional .field)
+                i = int(idx)
+                if 0 <= i < len(mf) and mf[i].get("robot_id"):
+                    robots.add(mf[i]["robot_id"])
+    return robots
+
+
 def _tau_for_diagnosis() -> float:
     return DV_TAU_DIAGNOSIS
 
@@ -123,20 +186,21 @@ def validate_diagnosis(
     else:
         for item in evidence:
             for ref in item.get("refs", []):
-                if not _resolve_ref(ref, input_bundle):
+                if not _ref_grounded(ref, input_bundle):
                     notes.append(f"unresolvable ref: {ref!r}")
                     result = DVResult.REJECT
 
-    # 3. Consistency: zone_wide/fleet_wide scope should reference multiple robots
+    # 3. Consistency: zone_wide/fleet_wide scope must cite ≥2 distinct robots.
+    #    We resolve each mission_failures ref to its actual robot_id rather than
+    #    counting ref strings — a bare "mission_failures" ref covering four robots
+    #    counts correctly, and two refs to [0] (same robot) still counts as one.
     scope = agent_output.get("scope", "")
     if scope in ("zone_wide", "fleet_wide"):
-        refs_all = [r for item in evidence for r in item.get("refs", [])]
-        mission_refs = [r for r in refs_all if "mission_failures" in r]
-        if len(mission_refs) < 2:
+        robots = _referenced_robot_ids(evidence, input_bundle)
+        if len(robots) < 2:
             notes.append(
-                f"scope={scope} but evidence references <2 mission_failures entries"
+                f"scope={scope} but evidence cites <2 distinct robots in mission_failures"
             )
-            # Downgrade to DEGRADE only (not REJECT) — maybe agent cited aggregate
             if result == DVResult.PASS:
                 result = DVResult.DEGRADE
 
@@ -183,7 +247,7 @@ def validate_strategy(
     evidence = agent_output.get("evidence", [])
     for item in evidence:
         for ref in item.get("refs", []):
-            if not _resolve_ref(ref, input_bundle):
+            if not _ref_grounded(ref, input_bundle):
                 notes.append(f"unresolvable ref: {ref!r}")
                 result = DVResult.REJECT
 

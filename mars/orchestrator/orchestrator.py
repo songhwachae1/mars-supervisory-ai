@@ -101,57 +101,49 @@ class Orchestrator:
         self, failure_event: dict[str, Any], conn
     ) -> dict[str, Any]:
         """
-        Main entry point.  Called by Aggregator's on_failure callback.
-        Returns a summary dict describing what was done.
+        Fast-path entry point — called immediately per failure after ingest.
+
+        Failure is already persisted at ingest; failure_id is on the event.
+        This method handles FAST disposition only; slow-path analysis is
+        coalesced per zone and driven through handle_slow_analysis().
         """
-        robot_id = failure_event.get("robot_id", "?")
-        zone = failure_event.get("zone", "unknown")
+        robot_id   = failure_event.get("robot_id", "?")
+        zone       = failure_event.get("zone", "unknown")
+        failure_id = failure_event.get("failure_id")  # pre-persisted at ingest
 
-        # Write to blackboard
-        failure_id = self._bb.write_failure(conn, failure_event)
-        conn.commit()
+        disposition = failure_event.get("_disposition") or fast_disposition(failure_event)
+        log.info("[orchestrator] FAST  robot=%s zone=%s disposition=%s",
+                 robot_id, zone, disposition)
+        return {"path": "fast", "disposition": disposition, "failure_id": failure_id}
 
-        # Check active policies for routing
-        active_policies = self._pm.get_active()
-        active_policy_on_zone = self._pm.is_policy_active_for_zone(zone)
+    def handle_slow_analysis(
+        self, trigger_event: dict[str, Any], conn
+    ) -> dict[str, Any]:
+        """
+        Coalesced slow-path entry point — called ONCE per zone-burst.
 
-        # Route
-        path = route(
-            failure_event,
-            active_policy_on_zone=active_policy_on_zone,
-            zone_in_degraded_set=False,  # TODO: maintain degraded set
-        )
+        trigger_event is the latest slow failure in the zone; its failure_id
+        is the FK for the diagnosis row.  All failures in the burst are
+        already persisted (Change 1) and visible to the investigator's tools.
+        """
+        robot_id   = trigger_event.get("robot_id", "?")
+        zone       = trigger_event.get("zone", "unknown")
+        failure_id = trigger_event.get("failure_id")
 
-        if path == Path.FAST:
-            disposition = fast_disposition(failure_event)
-            log.info("[orchestrator] FAST  robot=%s zone=%s disposition=%s",
-                     robot_id, zone, disposition)
-            if disposition == "escalate":
-                # Fast path couldn't handle it — re-route to slow
-                path = Path.SLOW
-            else:
-                return {"path": "fast", "disposition": disposition, "failure_id": failure_id}
+        log.info("[orchestrator] SLOW (coalesced)  zone=%s trigger_robot=%s", zone, robot_id)
 
-        # SLOW PATH
-        log.info("[orchestrator] SLOW  robot=%s zone=%s", robot_id, zone)
-
-        # 1. Immediate provisional safe action (park/hold — don't retry into suspect zone)
+        # Provisional safe action
         log.info("[orchestrator] provisional safe action: HOLD robot=%s", robot_id)
 
-        # 2. Run the Failure Analysis Investigator.
-        #    The investigator assembles its own evidence via read-only tool calls
-        #    (query_failures, get_zone_state, search_incidents, …).  The orchestrator
-        #    no longer pre-assembles the bundle — it only supplies the trigger event.
-        #
-        #    INVARIANT preserved: failure_event.distribution is a routing signal only;
-        #    the investigator derives scope from the raw failures it queries itself.
-        agent_output = self._fa_agent.analyze(trigger_event=failure_event)
+        active_policies = self._pm.get_active()
 
-        # 3. Decision Validator.
-        #    Grounding is resolved against the tool transcript (same _resolve_ref
-        #    logic; the transcript dict has the same top-level keys the refs use).
+        # Investigator: evidence assembled via read-only tool calls.
+        # INVARIANT: trigger_event.distribution is a routing signal only;
+        # the investigator derives scope from raw failures it queries itself.
+        agent_output = self._fa_agent.analyze(trigger_event=trigger_event)
+
+        # Decision Validator — grounded against tool transcript
         transcript = agent_output.get("_tool_transcript", {})
-        # retrieval_trust: use whatever search_incidents returned, or LOW default
         retrieved_precedents = transcript.get("retrieved_precedents", [])
         if retrieved_precedents and isinstance(retrieved_precedents[0], dict):
             scores = [p.get("_trust_score", 0) for p in retrieved_precedents]
@@ -164,11 +156,13 @@ class Orchestrator:
             "support_count": len(retrieved_precedents),
         }
         dv_result, dv_notes = self._dv(agent_output, transcript, retrieval_trust)
+        log.info("===========dv result===============\n%s", dv_result)
+        log.info("===========dv result===============\n%s", dv_notes)
 
-        # Write diagnosis to blackboard
-        cause    = agent_output.get("cause", "unknown")
-        scope    = agent_output.get("scope", "isolated")
-        persist  = agent_output.get("persistence", "persistent")
+        # Write diagnosis — attaches to the representative (latest) failure_id
+        cause   = agent_output.get("cause", "unknown")
+        scope   = agent_output.get("scope", "isolated")
+        persist = agent_output.get("persistence", "persistent")
         diagnosis_id = self._bb.write_diagnosis(
             conn,
             {
@@ -186,14 +180,12 @@ class Orchestrator:
             },
         )
 
-        # Embed the diagnosis so future RAG queries retrieve this precedent.
-        # Only PASS/DEGRADE outputs are embedded; REJECT outputs are not worth
-        # surfacing as retrieval candidates.
+        # Embed the diagnosis for future RAG retrieval (PASS/DEGRADE only)
         if dv_result != DVResult.REJECT:
             try:
                 from mars.blackboard.queries import write_embedding
                 from datetime import datetime, timezone as _tz
-                _occurred = failure_event.get("occurred_at")
+                _occurred = trigger_event.get("occurred_at")
                 if isinstance(_occurred, (int, float)):
                     _occurred = datetime.fromtimestamp(_occurred, tz=_tz.utc)
                 _occurred = _occurred or datetime.now(_tz.utc)
@@ -207,10 +199,10 @@ class Orchestrator:
                     "source_id":   diagnosis_id,
                     "zone":        zone,
                     "failure_type": cause,
-                    "scope":        scope,
-                    "summary":      _summary,
-                    "embedding":    _emb,
-                    "recorded_at":  _occurred,
+                    "scope":       scope,
+                    "summary":     _summary,
+                    "embedding":   _emb,
+                    "recorded_at": _occurred,
                 })
             except Exception:
                 log.warning("[orchestrator] embedding failed for diagnosis %s — skipping", diagnosis_id)
@@ -224,15 +216,15 @@ class Orchestrator:
                 "failure_id": failure_id, "diagnosis_id": diagnosis_id,
             }
 
-        # 6. Disposition (possibly degraded)
+        # Disposition
         effective_diagnosis = agent_output if dv_result == DVResult.PASS else {
             **agent_output,
-            "scope": "isolated",    # force conservative scope on DEGRADE
+            "scope": "isolated",       # conservative on DEGRADE
             "persistence": "persistent",
         }
-        disposition = slow_disposition(failure_event, effective_diagnosis, active_policies)
+        disposition = slow_disposition(trigger_event, effective_diagnosis, active_policies)
 
-        # 7. Strategy Trigger Rules
+        # Strategy Trigger Rules
         self._strategy_trigger(
             failure_out=effective_diagnosis,
             failure_id=failure_id,

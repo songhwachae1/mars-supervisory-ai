@@ -33,6 +33,7 @@ import queue
 import sys
 import threading
 import time
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,7 +41,7 @@ from typing import Any
 # Logging — set up before any mars imports so we catch all output
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s  %(name)-38s  %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
@@ -159,10 +160,14 @@ def build_components(conn_factory, hot_state, llm, embedder) -> dict[str, Any]:
         interval_sec=60.0,   # real production interval; demo calls run_once() directly
     )
 
+    from mars.agents.tools import InvestigatorTools
+    investigator_conn  = _make_investigator_conn()
+    investigator_tools = InvestigatorTools(investigator_conn, embedder)
+
     orchestrator = Orchestrator(
         blackboard_queries=Q,
         hot_state=hot_state,
-        failure_analysis_agent=FailureAnalysisAgent(llm),
+        failure_analysis_agent=FailureAnalysisAgent(llm, investigator_tools),
         retrieval_validator_fn=validate_retrieval_set,
         decision_validator_fn=validate_diagnosis,
         strategy_trigger_fn=strategy_trigger.evaluate,
@@ -187,13 +192,14 @@ def build_components(conn_factory, hot_state, llm, embedder) -> dict[str, Any]:
     policy_manager.register_consumer(_on_policy_event)
 
     return {
-        "orchestrator":      orchestrator,
-        "policy_manager":    policy_manager,
+        "orchestrator":       orchestrator,
+        "policy_manager":     policy_manager,
         "scheduling_service": scheduling_service,
-        "charging_service":  charging_service,
-        "strategy_trigger":  strategy_trigger,
-        "fleet_monitor":     fleet_monitor,
-        "outcome_evaluator": outcome_evaluator,
+        "charging_service":   charging_service,
+        "strategy_trigger":   strategy_trigger,
+        "fleet_monitor":      fleet_monitor,
+        "outcome_evaluator":  outcome_evaluator,
+        "investigator_conn":  investigator_conn,  # kept for cleanup in run_demo()
     }
 
 
@@ -311,18 +317,70 @@ def run_demo() -> None:
     seed_world(conn_main)
 
     # -- Build components --
-    components       = build_components(conn_factory, hot_state, llm, embedder)
-    orchestrator     = components["orchestrator"]
-    policy_manager   = components["policy_manager"]
-    scheduling_svc   = components["scheduling_service"]
-    charging_service = components["charging_service"]
-    fleet_monitor    = components["fleet_monitor"]
+    components        = build_components(conn_factory, hot_state, llm, embedder)
+    orchestrator      = components["orchestrator"]
+    policy_manager    = components["policy_manager"]
+    scheduling_svc    = components["scheduling_service"]
+    charging_service  = components["charging_service"]
+    fleet_monitor     = components["fleet_monitor"]
+    investigator_conn = components["investigator_conn"]
 
-    # -- Event queue: sim callbacks → main thread --
+    # -- Event queue: sim callbacks → main thread (sequential processing) --
     event_queue: queue.Queue[dict] = queue.Queue()
+    _ingest_lock = threading.Lock()
+
+    from mars.config import COALESCE_WINDOW_SECONDS
+    from mars.orchestrator.coalescer import ZoneCoalescer
+
+    def _on_coalesced(zone: str, trigger: dict) -> None:
+        """Called by ZoneCoalescer when a zone's window closes — queues one analysis."""
+        event_queue.put({"_coalesced": True, "_zone": zone, "_trigger": trigger})
+
+    coalescer = ZoneCoalescer(
+        window_sec=COALESCE_WINDOW_SECONDS,
+        on_zone_ready=_on_coalesced,
+    )
 
     def on_failure_event(event: dict) -> None:
-        event_queue.put(event)
+        """
+        Ingest callback — runs on sim thread.
+
+        1. Write failure row and COMMIT immediately (before investigator reads).
+        2. Update HotState distribution counters.
+        3. Route: fast → queue immediately; slow → feed coalescer.
+        """
+        with _ingest_lock:
+            # Step 1: persist failure on the write connection
+            _write_conn = conn_factory()
+            try:
+                failure_id = Q.write_failure(_write_conn, event)
+                event["failure_id"] = failure_id
+                _write_conn.commit()
+            except Exception:
+                log.exception("[ingest] write_failure failed — dropping event")
+                return
+            finally:
+                _write_conn.close()
+
+        # Step 2: update hot-state distribution (already done inside Aggregator
+        #         before this callback fires — no extra action needed here)
+
+        # Step 3: route
+        active_on_zone = policy_manager.is_policy_active_for_zone(event.get("zone", ""))
+        from mars.router.router import route as _route, Path as _Path
+        from mars.orchestrator.orchestrator import fast_disposition as _fast_disp
+        path = _route(event, active_policy_on_zone=active_on_zone, zone_in_degraded_set=False)
+
+        if path == _Path.FAST:
+            disp = _fast_disp(event)
+            if disp != "escalate":
+                event["_disposition"] = disp
+                event_queue.put(dict(event))   # fast path: immediate
+                return
+            # escalate falls through to slow
+
+        # Slow path: feed coalescer (debounce per zone)
+        coalescer.ingest(event)
 
     aggregator = Aggregator(hot_state, on_failure_event=on_failure_event)
 
@@ -345,26 +403,34 @@ def run_demo() -> None:
     fi.inject_zone_failure("Receiving Dock", _ROBOTS[:4], delay_between_sec=0.05)
 
     # -- Process events from the queue --
+    # Drain until queue is empty AND no coalescing window is still open.
+    # Keep processing sequential so dedup logic is correct.
     results: list[dict] = []
-    deadline = time.time() + 8.0  # wait up to 8 s for all events
+    SAFETY_CAP_SEC = 60.0
+    deadline = time.time() + SAFETY_CAP_SEC
 
     print()
     while time.time() < deadline:
         try:
-            event = event_queue.get(timeout=0.5)
+            event = event_queue.get(timeout=0.2)
         except queue.Empty:
-            if results:
-                break
-            continue
+            if not coalescer.has_open_windows():
+                break      # queue drained AND all zone windows closed
+            continue       # windows still open; keep waiting
 
         conn = conn_factory()
         try:
-            result = orchestrator.handle_failure(event, conn)
+            if event.get("_coalesced"):
+                # One coalesced analysis per zone-burst
+                result = orchestrator.handle_slow_analysis(event["_trigger"], conn)
+            else:
+                # Fast-path event (already routed at ingest)
+                result = orchestrator.handle_failure(event, conn)
             conn.commit()
             results.append(result)
-            _print_event_result(event, result)
+            _print_event_result(event.get("_trigger", event), result)
         except Exception:
-            log.exception("handle_failure raised")
+            log.exception("handle raised")
             conn.rollback()
         finally:
             conn.close()
@@ -409,6 +475,7 @@ def run_demo() -> None:
 
     # -- Summary --
     _print_summary(results, policy_manager, scheduling_svc, conn_main)
+    investigator_conn.close()
     conn_main.close()
 
 
@@ -489,6 +556,28 @@ def _print_summary(
 # Provider factories — graceful degradation
 # ---------------------------------------------------------------------------
 
+def _make_investigator_conn():
+    """
+    Return a read-only connection for the investigator tools.
+
+    Tries DB_READONLY_DSN (mars_reader role) first so tools physically cannot
+    write.  Falls back to DB_DSN with a warning when the role isn't set up
+    (local dev without 0002_readonly_role.sql applied).
+    """
+    from mars.blackboard.db import connect_readonly, connect
+    from mars.config import DB_DSN
+    try:
+        conn = connect_readonly()
+        log.info("InvestigatorTools: read-only connection (mars_reader role)")
+        return conn
+    except Exception:
+        log.warning(
+            "read-only role unavailable — falling back to DB_DSN "
+            "(loses the physical write-guard; local dev only)"
+        )
+        return connect(DB_DSN)
+
+
 def _make_hot_state() -> HotState:
     try:
         import redis as redis_lib
@@ -503,29 +592,34 @@ def _make_hot_state() -> HotState:
 
 
 def _make_llm():
-    from mars.config import ANTHROPIC_API_KEY
+    from mars.config import OPENAI_API_KEY, ANTHROPIC_API_KEY
+    if OPENAI_API_KEY:
+        log.info("LLM: OpenAI investigator client (real) — supports chat_with_tools + complete_structured")
+        from mars.llm.client import get_investigator_client
+        return get_investigator_client("openai")
     if ANTHROPIC_API_KEY:
-        log.info("LLM: Anthropic Claude (real)")
+        log.info("LLM: Anthropic Claude (real) — investigator will use fallback diagnosis")
         return get_llm_client("anthropic")
-    log.warning("LLM: ANTHROPIC_API_KEY not set — using mock LLM (canned output)")
+    log.warning("LLM: no API key — using ToolCallMockClient (investigator returns fallback diagnosis)")
+    from mars.llm.client import ToolCallMockClient
     from tests.conftest import ZONE_WIDE_DIAGNOSIS, AVOID_ZONE_STRATEGY
-    from mars.llm.client import MockLLMClient
-
-    class _MultiMock:
-        """Routes to diagnosis or strategy output by system-prompt content."""
+    # ToolCallMockClient supports chat_with_tools; routes complete_structured by prompt
+    class _MultiMock(ToolCallMockClient):
         def complete_structured(self, system_prompt, user_message, output_schema, *, temperature=0.0):
-            if "DIAGNOSE" in system_prompt:
+            if "DIAGNOSE" in system_prompt or "investigation" in system_prompt.lower():
                 return dict(ZONE_WIDE_DIAGNOSIS)
             return dict(AVOID_ZONE_STRATEGY)
-
     return _MultiMock()
 
 
 def _make_embedder():
-    from mars.config import VOYAGE_API_KEY
+    from mars.config import VOYAGE_API_KEY, OPENAI_API_KEY
     if VOYAGE_API_KEY:
         log.info("Embedder: Voyage AI voyage-3")
         return get_embedder("voyage")
+    if OPENAI_API_KEY:
+        log.info("Embedder: OpenAI text-embedding-3-small")
+        return get_embedder("openai")
     log.info("Embedder: mock (zero-vectors) — RAG store starts empty (expected on first run)")
     return get_embedder("mock")
 

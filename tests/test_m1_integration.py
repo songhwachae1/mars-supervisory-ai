@@ -259,7 +259,7 @@ def _make_components(bb, hot_state, llm, embedder):
     # failures_getter uses a live reference so pre-seeded failures are visible.
     investigator_llm   = ToolCallMockClient(canned_diagnosis=ZONE_WIDE_DIAGNOSIS)
     investigator_tools = MockInvestigatorTools(
-        failures_getter=lambda: list(bb.failures.values()),
+        failures_getter=lambda: list(bb.failures.values()),  # bb.failures is dict[id→event]
         zone_states={"Receiving Dock": {"zone": "Receiving Dock", "occupancy": 4,
                                          "health_status": "ok", "recent_failure_count": 4}},
     )
@@ -403,13 +403,14 @@ class TestM1VerticalSlice:
             bb, hot_state, mock_llm_multi, mock_embedder
         )
 
-        # Pre-seed failures from R2/R3/R4 directly (don't process through pipeline)
+        # Pre-seed failures from R2/R3/R4 (simulating burst ingest)
         for rid in ["R2", "R3", "R4"]:
             bb.write_failure(None, _make_failure(rid, 2, 4))
 
-        # Now process R1 — get_recent_failures returns all 4 events → PASS
+        # Write R1 failure (simulating ingest) and run coalesced slow-path analysis
         event = _make_failure("R1", failures_for_mission=2, zone_spread=4)
-        orchestrator.handle_failure(event, conn)
+        event["failure_id"] = bb.write_failure(None, event)
+        orchestrator.handle_slow_analysis(event, conn)
 
         active = policy_manager.get_active()
         avoid_policies = [p for p in active if p.get("type") == "avoid_zone"]
@@ -435,12 +436,14 @@ class TestM1VerticalSlice:
         sched = SchedulingService(lambda: conn)
         policy_manager.register_consumer(sched.on_policy_change)
 
-        # Pre-seed 3 failures so the 4th handle_failure call sees all 4 in bundle
+        # Pre-seed 3 failures (simulating burst ingest)
         for rid in ["R2", "R3", "R4"]:
             bb.write_failure(None, _make_failure(rid, 2, 4))
 
+        # Write R1 failure and run coalesced slow-path analysis
         event = _make_failure("R1", failures_for_mission=2, zone_spread=4)
-        orchestrator.handle_failure(event, conn)
+        event["failure_id"] = bb.write_failure(None, event)
+        orchestrator.handle_slow_analysis(event, conn)
 
         # The scheduler must have received the policy activation callback
         assert "Receiving Dock" in sched._avoid_zones, (

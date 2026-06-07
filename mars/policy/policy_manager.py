@@ -41,7 +41,11 @@ class PolicyManager:
 
         policy["policy_id"] = pid
         self._active[pid] = policy
-        self._last_applied[policy.get("type", "")] = time.time()
+        # Key on (type, zone) so different zones are rate-limited independently.
+        p_type    = policy.get("type", "")
+        zone      = policy.get("params", {}).get("zone")
+        last_key  = (p_type, zone) if zone else p_type
+        self._last_applied[last_key] = time.time()
 
         for filter_type, cb in self._consumers:
             if filter_type is None or filter_type == policy.get("type"):
