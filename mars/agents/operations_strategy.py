@@ -33,8 +33,22 @@ For each policy:
   - duration_sec  how long it should hold (the system stamps absolute expiry)
   - rationale   one line tying it to specific evidence
 
-Also produce confidence (0-1, trust-bounded as above), evidence (grounded with
-refs), and relied_on_precedents.
+Also produce confidence (0-1), evidence (grounded with refs), and
+relied_on_precedents.
+
+Every ref in `evidence` MUST be a path that resolves from the TOP LEVEL of the
+input you received. Your top-level fields are: incident_analysis, fleet_analysis,
+operational_metrics, available_policy_types, active_policies, retrieved_precedents.
+Cite the supporting datum's path, e.g.:
+  - "incident_analysis.scope"
+  - "incident_analysis.affected_zone"
+  - "fleet_analysis.bottlenecks[0]"
+  - "operational_metrics.mission_backlog"
+  - "active_policies[0].type"
+  - a retrieved precedent by its id (e.g. "SR689d49855aa7")
+Do NOT cite the failure investigator's raw fields such as "zone_state" or
+"mission_failures" — they are not in your input. Ground your reasoning in the
+diagnosis conclusions (incident_analysis.*), fleet state, and metrics.
 
 Output ONLY the JSON object. No prose.\
 """

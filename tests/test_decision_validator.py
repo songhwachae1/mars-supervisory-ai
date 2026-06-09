@@ -182,6 +182,37 @@ class TestPrecedentIdGrounding:
         assert _retrieved_precedent_ids({}) == set()
         assert _retrieved_precedent_ids({"retrieved_precedents": []}) == set()
 
+    def test_source_id_key_also_collected(self):
+        """
+        Fleet monitor returns raw incident_embeddings rows where `id` is the
+        integer PK and `source_id` is the DX… string.  Both must be recognized.
+        """
+        bundle = {
+            "retrieved_precedents": [
+                {"id": 7, "source_id": "DX157601ead162", "summary": "dock congestion"},
+                {"id": 8, "source_id": "INC#42",          "summary": "zone block"},
+            ]
+        }
+        ids = _retrieved_precedent_ids(bundle)
+        assert "DX157601ead162" in ids
+        assert "INC#42" in ids
+        assert "7" in ids    # integer PK coerced to str
+
+    def test_fleet_monitor_source_id_ref_is_grounded(self):
+        """
+        When the fleet monitor provides raw rows (id=int, source_id=DX…),
+        an agent citing the DX… string must be grounded — not REJECTED.
+        """
+        bundle = {
+            "trigger_event": {"robot_id": "R1", "fault_flag": None},
+            "mission_failures": [{"robot_id": "R1"}, {"robot_id": "R2"}],
+            "retrieved_precedents": [
+                {"id": 7, "source_id": "DX157601ead162", "summary": "dock congestion", "trust": 0.8},
+            ],
+        }
+        assert _ref_grounded("DX157601ead162", bundle) is True
+        assert _ref_grounded("DX999fabricated", bundle) is False
+
     def test_diagnosis_with_id_ref_passes(self):
         """
         The M2 fleet case: evidence citing a retrieved precedent by ID

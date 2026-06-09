@@ -218,6 +218,10 @@ class StrategyTrigger:
                     "retrieval_trust_level":     retrieval_trust.get("set_level"),
                     "no_action_reason":      strategy_out.get("no_action_reason"),
                 })
+                # Commit immediately so the strategy_runs row is visible to
+                # PolicyManager.activate(), which opens its own connection and
+                # inserts a policy that FKs to this strategy_run_id.
+                conn.commit()
             except Exception:
                 log.warning("[strategy_trigger] write_strategy_run failed — continuing without persist")
 

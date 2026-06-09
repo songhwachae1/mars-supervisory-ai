@@ -48,42 +48,57 @@ import re as _re
 _MISSING = object()  # sentinel: field does not exist
 
 
-def _resolve_ref(ref: str, bundle: dict[str, Any]) -> bool:
-    """
-    Walk a JSON-path-style ref string against the bundle dict.
-
-    Supports:
-      "field_name"
-      "field_name.subfield"
-      "list_field[0]"
-      "list_field[0].subfield"
-
-    Returns True when the path EXISTS in the bundle, regardless of whether the
-    value is None — a null field IS verifiable evidence (e.g. fault_flag=null
-    means no fault was detected).  Returns False only when the path cannot be
-    walked (field does not exist, list index out of range, etc.).
-    """
-    parts = []
+def _path_exists(ref: str, root: Any) -> bool:
+    """Walk a JSON-path ref ('a.b[0].c') from `root`. True if the path exists
+    (value may be None — a null field is still verifiable evidence)."""
+    current = root
     for segment in ref.split("."):
-        if "[" in segment:
-            name, rest = segment.split("[", 1)
-            idx = int(rest.rstrip("]"))
-            parts.append((name, idx))
-        else:
-            parts.append((segment, None))
-
-    current: Any = bundle
-    for name, idx in parts:
         if not isinstance(current, dict):
             return False
-        current = current.get(name, _MISSING)
-        if current is _MISSING:
-            return False          # field does not exist → unresolvable
-        if idx is not None:
-            if not isinstance(current, list) or idx >= len(current):
+        if "[" in segment:
+            name, rest = segment.split("[", 1)
+            try:
+                idx = int(rest.rstrip("]"))
+            except ValueError:
+                return False
+            current = current.get(name, _MISSING)
+            if current is _MISSING or not isinstance(current, list) or idx >= len(current):
                 return False
             current = current[idx]
-    return True                   # path exists; value may be None
+        else:
+            current = current.get(segment, _MISSING)
+            if current is _MISSING:
+                return False
+    return True
+
+
+def _resolves_nested(ref: str, node: Any, _depth: int = 0) -> bool:
+    if _depth > 6 or not isinstance(node, dict):
+        return False
+    for value in node.values():
+        if isinstance(value, dict):
+            if _path_exists(ref, value) or _resolves_nested(ref, value, _depth + 1):
+                return True
+        elif isinstance(value, list):
+            for el in value:
+                if isinstance(el, dict) and (
+                    _path_exists(ref, el) or _resolves_nested(ref, el, _depth + 1)
+                ):
+                    return True
+    return False
+
+
+def _resolve_ref(ref: str, bundle: dict[str, Any]) -> bool:
+    """
+    Grounded if the ref resolves as a path from the bundle root
+    (e.g. "incident_analysis.scope") OR — because agents often cite a field by
+    its section-relative name (e.g. "zone_state" instead of the full path) — if
+    it resolves under any nested dict the agent actually received. A field that
+    exists nowhere in the bundle still fails, so the hallucination guard holds.
+    """
+    if _path_exists(ref, bundle):
+        return True
+    return _resolves_nested(ref, bundle)
 
 
 def _retrieved_precedent_ids(bundle: dict) -> set[str]:
@@ -91,12 +106,22 @@ def _retrieved_precedent_ids(bundle: dict) -> set[str]:
     Return the set of stable IDs from the bundle's `retrieved_precedents` list.
     Only IDs that were actually retrieved are in this set — fabricated IDs never
     appear here, preserving the hallucination guard.
+
+    Two retrieval paths expose the identifier under different keys:
+      - failure investigator (search_incidents): renames it to `id` → DX… string
+      - fleet monitor (search_similar / SELECT *): keeps `source_id` → DX… string,
+        while `id` is the integer PK of incident_embeddings
+    Collecting both as strings ensures the grounding helper matches either path.
     """
-    return {
-        p["id"]
-        for p in (bundle.get("retrieved_precedents") or [])
-        if isinstance(p, dict) and p.get("id")
-    }
+    ids: set[str] = set()
+    for p in (bundle.get("retrieved_precedents") or []):
+        if not isinstance(p, dict):
+            continue
+        for key in ("id", "source_id"):
+            v = p.get(key)
+            if v is not None:
+                ids.add(str(v))
+    return ids
 
 
 def _ref_grounded(ref: str, bundle: dict) -> bool:
@@ -267,7 +292,9 @@ def validate_strategy(
             result = DVResult.DEGRADE
 
     notes_str = "; ".join(notes) if notes else "ok"
+    log.info("==============================================\n\n")
     log.info("[decision_validator] strategy → %s  notes=%s", result, notes_str)
+    log.info("==============================================\n\n")
     return result, notes_str
 
 

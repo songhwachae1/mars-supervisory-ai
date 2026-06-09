@@ -218,3 +218,44 @@ Failures are written and committed **at ingest** (in `demo.py`'s `on_failure_eve
 | Cooldown key | `(policy_type, zone)` tuple | Same zone is rate-limited across bursts; different zones are independent. Stored in `PolicyManager._last_applied`. |
 | Cumulative avoid_zone guard | Union of active + proposed avoid_zones | Per-policy reachability check was insufficient for multi-zone bursts (each passes individually while together stranding robots). |
 | `MAX_ACTIVE_AVOID_ZONES` | `3` | Cap on simultaneous avoid_zone policies; hitting it defers to operator via `DEFER_HUMAN` rather than stacking another avoidance. |
+
+---
+
+## 17. Strategy-run commit point (2026-06-08)
+
+`StrategyTrigger._run_strategy` commits `conn` immediately after a successful `write_strategy_run` call. The commit is placed inside the success branch (when `strategy_run_id is not None`); the "write_strategy_run failed — continuing without persist" exception path leaves `strategy_run_id` as `None` and issues no commit.
+
+**Why:** `PolicyManager.activate()` opens its own database connection to insert the policy row. That row carries a FK to `strategy_runs`. Without the commit, the `strategy_runs` row exists only inside `conn`'s uncommitted transaction and is invisible to PolicyManager's separate connection, causing a `ForeignKeyViolation` at INSERT.
+
+Committing here is intentional and safe: a strategy run that produced no policy (e.g. guardrail blocked all proposals) is still a valid, auditable record.
+
+---
+
+## 18. Precedent grounding: `id` and `source_id` both recognized (2026-06-08)
+
+`_retrieved_precedent_ids(bundle)` in `mars/validators/decision_validator.py` now collects both the `id` and `source_id` fields from each entry in `retrieved_precedents`, converting both to strings.
+
+**Why — two retrieval paths, two key names:**
+- **Failure investigator** (`search_incidents` tool): renames the stored identifier to `id` → value is the `DX…` string the agent cites.
+- **Fleet monitor** (`search_similar` / `SELECT * FROM incident_embeddings`): returns raw rows where `id` is the integer primary key and `source_id` is the `DX…` string. The agent cites the `DX…` value; the old helper only looked at `id` (the integer PK), so no ref ever matched → every cited ID was "unresolvable" → REJECT.
+
+Collecting both keys preserves the hallucination guard: only IDs *actually present* in the retrieved set are accepted; a `DX…` string not in `retrieved_precedents` still fails.
+
+---
+
+## 19. Strategy-agent ref vocabulary + section-relative ref resolution (2026-06-09)
+
+### Fix 1 — strategy agent cites its own bundle
+
+`_SYSTEM_PROMPT` in `mars/agents/operations_strategy.py` now explicitly enumerates the strategy bundle's top-level keys (`incident_analysis`, `fleet_analysis`, `operational_metrics`, `available_policy_types`, `active_policies`, `retrieved_precedents`) and tells the agent to cite paths from those sections only. The agent was previously citing the failure investigator's vocabulary (`zone_state`, `mission_failures`) because earlier prompts used those terms — they are not top-level in the strategy bundle.
+
+### Fix 2 — `_resolve_ref` tries nested resolution as fallback
+
+`_resolve_ref` in `mars/validators/decision_validator.py` was refactored into three functions:
+- `_path_exists(ref, root)` — pure path walker from a given root, used by both strategies below.
+- `_resolve_ref(ref, bundle)` — tries root-level first; if not found, falls back to `_resolves_nested`.
+- `_resolves_nested(ref, node, depth)` — DFS over nested dicts/lists (depth cap 6) to find a section-relative ref that resolves anywhere in the data the agent received.
+
+**Why:** agents legitimately produce section-relative refs (e.g. `"zone_state"` instead of `"incident_analysis._input_bundle.zone_state"`). The old root-only walker flagged these "unresolvable" → REJECT even though the field genuinely existed in the received bundle. The nested fallback accepts any ref that resolves *somewhere* in the bundle; a string that appears nowhere still returns False, preserving the hallucination guard.
+
+Fix 1 is the primary correction (agents should cite the right vocabulary). Fix 2 is defense-in-depth for refs that are section-relative but real.

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+import json
 from typing import Any
 
 from mars.router.router import Path, route
@@ -156,8 +157,6 @@ class Orchestrator:
             "support_count": len(retrieved_precedents),
         }
         dv_result, dv_notes = self._dv(agent_output, transcript, retrieval_trust)
-        log.info("===========dv result===============\n%s", dv_result)
-        log.info("===========dv result===============\n%s", dv_notes)
 
         # Write diagnosis — attaches to the representative (latest) failure_id
         cause   = agent_output.get("cause", "unknown")
